@@ -54,6 +54,34 @@ const event = {
 };
 afterEach(() => vi.restoreAllMocks());
 describe("durable admission", () => {
+  it("admits review mentions from other senders and channels when opened globally", async () => {
+    const f = vi.fn<typeof fetch>().mockResolvedValue(Response.json({ messageId: "review" }));
+    const response = await acceptSlack(request({ ...event, channel: "C99", user: "U99", text: "<@U1> review PR #123" }),
+      { ...env, SLACK_TASK_FILTER: "pr_review", SLACK_ALLOWED_CHANNEL_IDS: "all", SLACK_ALLOWED_SENDER_IDS: "all" }, f);
+    expect(await response.json()).toEqual({ action: "accepted", queueMessageId: "review" });
+    expect(f).toHaveBeenCalledTimes(1);
+  });
+  it.each(["<@U1> 帮忙部署", "<@U1> 合并 PR #123", "<@U3> review PR #123", "<@U1> 不用 review PR #123"])("does not enqueue unrelated requests: %s", async text => {
+    const f = vi.fn<typeof fetch>();
+    const response = await acceptSlack(request({ ...event, text }), { ...env, SLACK_TASK_FILTER: "pr_review" }, f);
+    expect((await response.json()).action).toBe("ignored");
+    expect(f).not.toHaveBeenCalled();
+  });
+  it("rechecks review policy for events queued before the policy changed", async () => {
+    const f = vi.fn<typeof fetch>();
+    const response = await consumeQueue(new Request(env.RELAY_CONSUMER_URL, { method: "POST", body: JSON.stringify({
+      teamId: "T1", channelId: "C1", senderUserId: "U2", messageTs: "1.000001", threadTs: "1.000001",
+      text: "<@U1> deploy this", mention: { type: "user", id: "U1" },
+    }) }), { ...env, SLACK_TASK_FILTER: "pr_review" }, f);
+    expect(await response.json()).toEqual({ action: "ignored", reason: "policy_changed" });
+    expect(f).not.toHaveBeenCalled();
+  });
+  it("fails closed for an invalid task filter", async () => {
+    const f = vi.fn<typeof fetch>();
+    const response = await acceptSlack(request(event), { ...env, SLACK_TASK_FILTER: "typo" }, f);
+    expect(response.status).toBe(500);
+    expect(f).not.toHaveBeenCalled();
+  });
   it("only publishes to queue before acknowledging", async () => {
     const fetcher = vi
       .fn<typeof fetch>()

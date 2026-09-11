@@ -15,6 +15,7 @@ import {
   type SlackThreadEvent,
 } from "./thread-router.js";
 import { UpstashThreadStore } from "./thread-store.js";
+import { isPrReviewRequest } from "./task-filter.js";
 
 export function json(value: unknown, status = 200): Response {
   return Response.json(value, { status });
@@ -47,6 +48,7 @@ function admitted(event: SlackThreadEvent, config: RelayConfig): boolean {
     !config.blockedChannelIds.has(event.channelId) &&
     (config.allowAllSenders || config.allowedSenderIds.has(event.senderUserId)) &&
     !config.blockedSenderIds.has(event.senderUserId) &&
+    (config.taskFilter === "all" || isPrReviewRequest(event.text)) &&
     !!findTargetMention(
       event.text,
       config.targetUserIds,

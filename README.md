@@ -17,6 +17,14 @@
 - `comment_persisted` 只表示评论保存，实际执行和原 thread 回复要分别验收。
 - Prompt 真源为 [AGENT-PROMPT.md](AGENT-PROMPT.md)，需要明确同步到 Multica Agent instructions。Relay 不调用 Codex 或修改 Multica 源码。
 
+## 仅接收 PR Review
+
+设置 `SLACK_TASK_FILTER=pr_review`，同时保留目标用户 ID 校验。若需让所有可接收事件的频道、所有发送者都能发起请求，可将 `SLACK_ALLOWED_CHANNEL_IDS` 和 `SLACK_ALLOWED_SENDER_IDS` 设为 `all`。此设置不会扩大 Slack App 自身的访问权限。
+
+触发消息本身必须同时包含 PR 线索（`PR`、`pull request`、合并请求或 GitHub PR 链接）和评审意图（`review`、`CR`、审查、评审、审核、看下等）。例如 `@Peter 请 review https://github.com/org/repo/pull/123`；普通提及、只贴链接、仅要求合并、明确不用评审或已完成评审的消息会被忽略。代码片段、引用消息及链接标签不参与意图判断；不会读取父消息补全 PR 线索，复审时请写明 `重新 review PR #123`。
+
+过滤在入队前和消费时均执行，策略变更后旧队列消息也须满足当前规则。默认 `all` 保持原行为；未知配置值会拒绝处理。这里是保守的文本规则，并非完整语义识别，Agent 仍须核对实际请求，只执行 PR review，非评审请求保持静默。启用时先部署过滤代码与 Agent 规则，再开放频道和发送者范围；回滚到旧代码前先恢复受限范围。
+
 ## 本地验证
 
 ```bash

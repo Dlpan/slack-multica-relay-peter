@@ -1,4 +1,7 @@
+import { taskFilter, type TaskFilter } from "./task-filter.js";
+
 export interface RelayConfig {
+  taskFilter: TaskFilter;
   signingSecret: string;
   teamId: string;
   targetUserIds: Set<string>;
@@ -36,6 +39,7 @@ export function loadRelayConfig(
   if (!targetUserIds.size && !targetSubteamIds.size)
     throw new Error("missing_mention_target");
   return {
+    taskFilter: taskFilter(env.SLACK_TASK_FILTER),
     signingSecret: required(env, "SLACK_SIGNING_SECRET"),
     teamId: required(env, "SLACK_TEAM_ID"),
     allowedChannelIds: allowedChannels.ids,
