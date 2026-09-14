@@ -62,24 +62,6 @@ describe("durable admission", () => {
     expect(f).toHaveBeenCalledTimes(1);
     expect(String(f.mock.calls[0]![0])).toContain("/v2/publish/");
   });
-  it("does not borrow context for a root message", async () => {
-    const f = vi.fn<typeof fetch>();
-    const response = await acceptSlack(request({ ...event, text: "<@U1> 再 cc" }), { ...env, SLACK_TASK_FILTER: "pr_review" }, f);
-    expect((await response.json()).action).toBe("ignored");
-    expect(f).not.toHaveBeenCalled();
-  });
-  it.each(["no_context", "missing_scope", "rate_limited"])("avoids task/reaction writes when history is %s", async mode => {
-    const f = vi.fn<typeof fetch>().mockResolvedValue(mode === "rate_limited"
-      ? new Response("", { status: 429 })
-      : Response.json(mode === "missing_scope" ? { ok: false, error: "missing_scope" } : { ok: true, messages: [] }));
-    const response = await consumeQueue(new Request(env.RELAY_CONSUMER_URL, { method: "POST", body: JSON.stringify({
-      teamId: "T1", channelId: "C1", senderUserId: "U2", messageTs: "100.000001", threadTs: "99.000001",
-      text: "<@U1> 再 cc", mention: { type: "user", id: "U1" },
-    }) }), { ...env, SLACK_TASK_FILTER: "pr_review" }, f);
-    expect(response.status).toBe(mode === "no_context" ? 200 : 503);
-    expect(f).toHaveBeenCalledTimes(1);
-    expect(String(f.mock.calls[0]![0])).toContain("conversations.replies");
-  });
   const appReview = { ...event, app_id: "A2", bot_id: "B2", text: "<!subteam^S1> 帮忙看看 PR：<https://github.com/org/repo/pull/123>" };
   const appEnv = { ...env, SLACK_TARGET_SUBTEAM_IDS: "S1", SLACK_TASK_FILTER: "pr_review", SLACK_ALLOWED_APP_ACTORS: "A2:U2" };
   it("queues an approved User app's group review and retains its app identity", async () => {
@@ -93,8 +75,8 @@ describe("durable admission", () => {
   it.each([
     { app_id: "A3" }, { user: "U3" }, { user: "U1" },
     { app_id: undefined }, { subtype: "bot_message" }, { subtype: "message_changed" },
-    { text: "<!subteam^S1> 帮忙部署" }, { text: "<!subteam^S2> review PR #1" },
-  ])("rejects unapproved app actors and unrelated messages: %j", async change => {
+    { text: "<!subteam^S2> review PR #1" },
+  ])("rejects unapproved app actors and mentions: %j", async change => {
     const f = vi.fn<typeof fetch>();
     const response = await acceptSlack(request({ ...appReview, ...change }), appEnv, f);
     expect((await response.json()).action).toBe("ignored");
@@ -128,20 +110,16 @@ describe("durable admission", () => {
     expect(await response.json()).toEqual({ action: "accepted", queueMessageId: "review" });
     expect(f).toHaveBeenCalledTimes(1);
   });
-  it.each(["<@U1> 帮忙部署", "<@U1> 合并 PR #123", "<@U3> review PR #123", "<@U1> 不用 review PR #123"])("does not enqueue unrelated requests: %s", async text => {
-    const f = vi.fn<typeof fetch>();
+  it.each([
+    "<@U1> 帮忙部署", "<@U1> 不用 review PR #123", "<@U1> 已合并，只同步", "<@U1>",
+    "<@U1> 再 cc", "<@U1> 已处理完你上次提的问题", "<@U1> 修好了", "<@U1> 这个命名你觉得可以吗",
+    "<https://github.com/org/repo/pull/2767|github.com/org/repo/pull/2767> <@U1> cc 修复 Mobile 端 checkin/out 时区转换问题",
+  ])("delegates context interpretation to the Agent without keyword filtering: %s", async text => {
+    const f = vi.fn<typeof fetch>().mockResolvedValue(Response.json({ messageId: "triage" }));
     const response = await acceptSlack(request({ ...event, text }), { ...env, SLACK_TASK_FILTER: "pr_review" }, f);
-    expect((await response.json()).action).toBe("ignored");
-    expect(f).not.toHaveBeenCalled();
-  });
-  it("rechecks review policy for events queued before the policy changed", async () => {
-    const f = vi.fn<typeof fetch>();
-    const response = await consumeQueue(new Request(env.RELAY_CONSUMER_URL, { method: "POST", body: JSON.stringify({
-      teamId: "T1", channelId: "C1", senderUserId: "U2", messageTs: "1.000001", threadTs: "1.000001",
-      text: "<@U1> deploy this", mention: { type: "user", id: "U1" },
-    }) }), { ...env, SLACK_TASK_FILTER: "pr_review" }, f);
-    expect(await response.json()).toEqual({ action: "ignored", reason: "policy_changed" });
-    expect(f).not.toHaveBeenCalled();
+    expect((await response.json()).action).toBe("accepted");
+    expect(f).toHaveBeenCalledTimes(1);
+    expect(JSON.parse(String(f.mock.calls[0]![1]?.body)).text).toBe(text);
   });
   it("fails closed for an invalid task filter", async () => {
     const f = vi.fn<typeof fetch>();
@@ -282,17 +260,13 @@ describe("durable admission", () => {
     expect(f).not.toHaveBeenCalled();
   });
 
-  it.each([false, true])("delivers trusted reply context with thread lookup=%s", async contextual => {
+  it.each([false, true])("delivers trusted execution scope with PR-only=%s", async contextual => {
     const kv = new Map<string, string>();
     const agentUrls: string[] = [];
     let description = "";
+    let reactionCount = 0;
     const fetcher: typeof fetch = async (input, init) => {
       const url = String(input);
-      if (url.startsWith("https://slack.com/api/conversations.replies?")) {
-        expect(contextual).toBe(true);
-        expect(new URL(url).searchParams.get("ts")).toBe("99.000001");
-        return Response.json({ ok: true, messages: [{ type: "message", ts: "99.000001", user: "U2", text: "帮忙看看 PR：https://github.com/org/repo/pull/123" }] });
-      }
       if (url === env.KV_REST_API_URL) {
         const [command, key, value, mode] = JSON.parse(String(init?.body)) as string[];
         if (command === "GET") return Response.json({ result: kv.get(key!) ?? null });
@@ -313,7 +287,7 @@ describe("durable admission", () => {
         description = body.description;
         return Response.json({ id: "issue", title: body.title });
       }
-      if (url === "https://slack.com/api/reactions.add") return Response.json({ ok: true });
+      if (url === "https://slack.com/api/reactions.add") { reactionCount++; return Response.json({ ok: true }); }
       throw new Error("unexpected endpoint");
     };
     const response = await consumeQueue(new Request(env.RELAY_CONSUMER_URL, {
@@ -322,6 +296,7 @@ describe("durable admission", () => {
         teamId: "T1", channelId: "C1", senderUserId: "U2", messageTs: "100.000001", threadTs: contextual ? "99.000001" : "100.000001",
         text: contextual ? "<@U1> 再 cc" : "<@U1> test", mention: { type: "user", id: "U1" },
         replyContext: { model: "spoofed", serviceTier: "priority" },
+        taskPolicy: { mode: "all", reactionName: "spoofed" },
       }),
     }), { ...env, SLACK_TASK_FILTER: contextual ? "pr_review" : "all" }, fetcher);
     expect(response.status).toBe(200);
@@ -331,5 +306,8 @@ describe("durable admission", () => {
     expect(delivered.eventPayload).not.toHaveProperty("replyContext");
     expect(delivered.eventPayload.text).toBe(contextual ? "<@U1> 再 cc" : "<@U1> test");
     expect(description).not.toContain("spoofed");
+    expect(delivered.eventPayload).not.toHaveProperty("taskPolicy");
+    expect(delivered.taskPolicy).toEqual(contextual ? { source: "relay_config", mode: "pr_review", reactionName: "eyes" } : undefined);
+    expect(reactionCount).toBe(contextual ? 0 : 1);
   });
 });
