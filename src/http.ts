@@ -48,6 +48,7 @@ function admitted(event: SlackThreadEvent, config: RelayConfig): boolean {
     !config.blockedChannelIds.has(event.channelId) &&
     (config.allowAllSenders || config.allowedSenderIds.has(event.senderUserId)) &&
     !config.blockedSenderIds.has(event.senderUserId) &&
+    (!event.sourceAppId || config.allowedAppActors.has(`${event.sourceAppId}:${event.senderUserId}`)) &&
     (config.taskFilter === "all" || isPrReviewRequest(event.text)) &&
     !!findTargetMention(
       event.text,
@@ -69,6 +70,7 @@ function parsedEvent(value: unknown): SlackThreadEvent {
         typeof value[k] !== "string" || !/^\d+\.\d+$/u.test(value[k] as string),
     ) ||
     typeof value.text !== "string" ||
+    (value.sourceAppId !== undefined && (typeof value.sourceAppId !== "string" || !/^A[A-Z0-9]+$/u.test(value.sourceAppId))) ||
     !record(value.mention) ||
     !["user", "subteam"].includes(String(value.mention.type)) ||
     typeof value.mention.id !== "string"
@@ -150,7 +152,7 @@ export async function acceptSlack(
   if (
     body.type !== "event_callback" ||
     !record(body.event) ||
-    !isSupportedMessage(body.event as SlackMessageEvent)
+    !isSupportedMessage(body.event as SlackMessageEvent, config.allowedAppActors)
   )
     return json({ action: "ignored" });
   const event = body.event;
@@ -168,6 +170,7 @@ export async function acceptSlack(
       messageTs: event.ts,
       threadTs: event.thread_ts ?? event.ts,
       senderUserId: event.user,
+      ...(event.app_id ? { sourceAppId: event.app_id } : {}),
       text: event.text,
       mention,
       ...(event.files ? { files: event.files } : {}),

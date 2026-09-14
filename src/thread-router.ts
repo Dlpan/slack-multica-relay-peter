@@ -22,6 +22,7 @@ export interface SlackThreadEvent {
   messageTs: string;
   threadTs: string;
   senderUserId: string;
+  sourceAppId?: string;
   text: string;
   mention: MentionMatch;
   files?: unknown;

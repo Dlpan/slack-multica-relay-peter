@@ -22,13 +22,15 @@ export function findTargetMention(
   return undefined;
 }
 
-export function isSupportedMessage(event: SlackMessageEvent): boolean {
+export function isSupportedMessage(event: SlackMessageEvent, allowedAppActors: ReadonlySet<string> = new Set()): boolean {
   const subtype = typeof event.subtype === 'string' ? event.subtype : undefined;
   return event.type === 'message'
     && typeof event.channel === 'string'
     && typeof event.ts === 'string'
     && typeof event.text === 'string'
-    && !event.bot_id
+    && ((!event.bot_id && !event.app_id)
+      || (typeof event.app_id === 'string' && typeof event.user === 'string'
+        && allowedAppActors.has(`${event.app_id}:${event.user}`)))
     && !['bot_message', 'message_changed', 'message_deleted'].includes(subtype ?? '');
 }
 
