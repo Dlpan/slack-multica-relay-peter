@@ -2,6 +2,7 @@ import { taskFilter, type TaskFilter } from "./task-filter.js";
 
 export interface RelayConfig {
   taskFilter: TaskFilter;
+  allowedAppActors: Set<string>;
   signingSecret: string;
   teamId: string;
   targetUserIds: Set<string>;
@@ -40,6 +41,7 @@ export function loadRelayConfig(
     throw new Error("missing_mention_target");
   return {
     taskFilter: taskFilter(env.SLACK_TASK_FILTER),
+    allowedAppActors: appActors(env.SLACK_ALLOWED_APP_ACTORS),
     signingSecret: required(env, "SLACK_SIGNING_SECRET"),
     teamId: required(env, "SLACK_TEAM_ID"),
     allowedChannelIds: allowedChannels.ids,
@@ -73,6 +75,12 @@ function required(env: NodeJS.ProcessEnv, key: string): string {
   const value = env[key]?.trim();
   if (!value) throw new Error("relay_not_configured");
   return value;
+}
+function appActors(value: string | undefined): Set<string> {
+  const entries = (value ?? "").split(",").map(x => x.trim()).filter(Boolean);
+  if (entries.some(x => !/^A[A-Z0-9]+:[UW][A-Z0-9]+$/u.test(x)))
+    throw new Error("invalid_app_actor");
+  return new Set(entries);
 }
 function ids(value: string | undefined): Set<string> {
   const values = (value ?? "")

@@ -54,6 +54,47 @@ const event = {
 };
 afterEach(() => vi.restoreAllMocks());
 describe("durable admission", () => {
+  const appReview = { ...event, app_id: "A2", bot_id: "B2", text: "<!subteam^S1> 帮忙看看 PR：<https://github.com/org/repo/pull/123>" };
+  const appEnv = { ...env, SLACK_TARGET_SUBTEAM_IDS: "S1", SLACK_TASK_FILTER: "pr_review", SLACK_ALLOWED_APP_ACTORS: "A2:U2" };
+  it("queues an approved User app's group review and retains its app identity", async () => {
+    const f = vi.fn<typeof fetch>().mockResolvedValue(Response.json({ messageId: "group-review" }));
+    const response = await acceptSlack(request(appReview), appEnv, f);
+    expect(await response.json()).toEqual({ action: "accepted", queueMessageId: "group-review" });
+    const queued = JSON.parse(String(f.mock.calls[0]![1]!.body));
+    expect(queued.sourceAppId).toBe("A2");
+    expect(queued.mention).toEqual({ type: "subteam", id: "S1" });
+  });
+  it.each([
+    { app_id: "A3" }, { user: "U3" }, { user: "U1" },
+    { app_id: undefined }, { subtype: "bot_message" }, { subtype: "message_changed" },
+    { text: "<!subteam^S1> 帮忙部署" }, { text: "<!subteam^S2> review PR #1" },
+  ])("rejects unapproved app actors and unrelated messages: %j", async change => {
+    const f = vi.fn<typeof fetch>();
+    const response = await acceptSlack(request({ ...appReview, ...change }), appEnv, f);
+    expect((await response.json()).action).toBe("ignored");
+    expect(f).not.toHaveBeenCalled();
+  });
+  it("rejects app messages by default", async () => {
+    const f = vi.fn<typeof fetch>();
+    const response = await acceptSlack(request(appReview), { ...appEnv, SLACK_ALLOWED_APP_ACTORS: "" }, f);
+    expect((await response.json()).action).toBe("ignored");
+    expect(f).not.toHaveBeenCalled();
+  });
+  it.each(["all", "A2:*", "A2", "A2:U2:U3"])("fails closed for invalid app actor configuration: %s", async value => {
+    const f = vi.fn<typeof fetch>();
+    const response = await acceptSlack(request(appReview), { ...appEnv, SLACK_ALLOWED_APP_ACTORS: value }, f);
+    expect(response.status).toBe(500);
+    expect(f).not.toHaveBeenCalled();
+  });
+  it("rechecks app actor permission when consuming a queued review", async () => {
+    const f = vi.fn<typeof fetch>();
+    const response = await consumeQueue(new Request(env.RELAY_CONSUMER_URL, { method: "POST", body: JSON.stringify({
+      teamId: "T1", channelId: "C1", senderUserId: "U2", sourceAppId: "A2", messageTs: "1.000001", threadTs: "1.000001",
+      text: appReview.text, mention: { type: "subteam", id: "S1" },
+    }) }), { ...appEnv, SLACK_ALLOWED_APP_ACTORS: "A2:U3" }, f);
+    expect(await response.json()).toEqual({ action: "ignored", reason: "policy_changed" });
+    expect(f).not.toHaveBeenCalled();
+  });
   it("admits review mentions from other senders and channels when opened globally", async () => {
     const f = vi.fn<typeof fetch>().mockResolvedValue(Response.json({ messageId: "review" }));
     const response = await acceptSlack(request({ ...event, channel: "C99", user: "U99", text: "<@U1> review PR #123" }),
