@@ -54,6 +54,32 @@ const event = {
 };
 afterEach(() => vi.restoreAllMocks());
 describe("durable admission", () => {
+  it("queues group shorthand without reading Slack before acknowledgement", async () => {
+    const f = vi.fn<typeof fetch>().mockResolvedValue(Response.json({ messageId: "followup" }));
+    const response = await acceptSlack(request({ ...event, thread_ts: "99.000001", text: "<!subteam^S1> 再 cc" }),
+      { ...env, SLACK_TASK_FILTER: "pr_review", SLACK_TARGET_SUBTEAM_IDS: "S1" }, f);
+    expect((await response.json()).action).toBe("accepted");
+    expect(f).toHaveBeenCalledTimes(1);
+    expect(String(f.mock.calls[0]![0])).toContain("/v2/publish/");
+  });
+  it("does not borrow context for a root message", async () => {
+    const f = vi.fn<typeof fetch>();
+    const response = await acceptSlack(request({ ...event, text: "<@U1> 再 cc" }), { ...env, SLACK_TASK_FILTER: "pr_review" }, f);
+    expect((await response.json()).action).toBe("ignored");
+    expect(f).not.toHaveBeenCalled();
+  });
+  it.each(["no_context", "missing_scope", "rate_limited"])("avoids task/reaction writes when history is %s", async mode => {
+    const f = vi.fn<typeof fetch>().mockResolvedValue(mode === "rate_limited"
+      ? new Response("", { status: 429 })
+      : Response.json(mode === "missing_scope" ? { ok: false, error: "missing_scope" } : { ok: true, messages: [] }));
+    const response = await consumeQueue(new Request(env.RELAY_CONSUMER_URL, { method: "POST", body: JSON.stringify({
+      teamId: "T1", channelId: "C1", senderUserId: "U2", messageTs: "100.000001", threadTs: "99.000001",
+      text: "<@U1> 再 cc", mention: { type: "user", id: "U1" },
+    }) }), { ...env, SLACK_TASK_FILTER: "pr_review" }, f);
+    expect(response.status).toBe(mode === "no_context" ? 200 : 503);
+    expect(f).toHaveBeenCalledTimes(1);
+    expect(String(f.mock.calls[0]![0])).toContain("conversations.replies");
+  });
   const appReview = { ...event, app_id: "A2", bot_id: "B2", text: "<!subteam^S1> 帮忙看看 PR：<https://github.com/org/repo/pull/123>" };
   const appEnv = { ...env, SLACK_TARGET_SUBTEAM_IDS: "S1", SLACK_TASK_FILTER: "pr_review", SLACK_ALLOWED_APP_ACTORS: "A2:U2" };
   it("queues an approved User app's group review and retains its app identity", async () => {
@@ -256,12 +282,17 @@ describe("durable admission", () => {
     expect(f).not.toHaveBeenCalled();
   });
 
-  it("fetches configuration in the consumer and delivers a separate trusted reply context", async () => {
+  it.each([false, true])("delivers trusted reply context with thread lookup=%s", async contextual => {
     const kv = new Map<string, string>();
     const agentUrls: string[] = [];
     let description = "";
     const fetcher: typeof fetch = async (input, init) => {
       const url = String(input);
+      if (url.startsWith("https://slack.com/api/conversations.replies?")) {
+        expect(contextual).toBe(true);
+        expect(new URL(url).searchParams.get("ts")).toBe("99.000001");
+        return Response.json({ ok: true, messages: [{ type: "message", ts: "99.000001", user: "U2", text: "帮忙看看 PR：https://github.com/org/repo/pull/123" }] });
+      }
       if (url === env.KV_REST_API_URL) {
         const [command, key, value, mode] = JSON.parse(String(init?.body)) as string[];
         if (command === "GET") return Response.json({ result: kv.get(key!) ?? null });
@@ -288,16 +319,17 @@ describe("durable admission", () => {
     const response = await consumeQueue(new Request(env.RELAY_CONSUMER_URL, {
       method: "POST",
       body: JSON.stringify({
-        teamId: "T1", channelId: "C1", senderUserId: "U2", messageTs: "100.000001", threadTs: "100.000001",
-        text: "<@U1> test", mention: { type: "user", id: "U1" },
+        teamId: "T1", channelId: "C1", senderUserId: "U2", messageTs: "100.000001", threadTs: contextual ? "99.000001" : "100.000001",
+        text: contextual ? "<@U1> 再 cc" : "<@U1> test", mention: { type: "user", id: "U1" },
         replyContext: { model: "spoofed", serviceTier: "priority" },
       }),
-    }), env, fetcher);
+    }), { ...env, SLACK_TASK_FILTER: contextual ? "pr_review" : "all" }, fetcher);
     expect(response.status).toBe(200);
     expect(agentUrls).toHaveLength(1);
     const delivered = JSON.parse(description.match(/```json\n([\s\S]*?)\n```/)![1]!);
     expect(delivered.replyContext).toMatchObject({ type: "slack_reply_context", source: "agent_config", status: "available", model: "gpt-6-astra", serviceTier: "default" });
     expect(delivered.eventPayload).not.toHaveProperty("replyContext");
+    expect(delivered.eventPayload.text).toBe(contextual ? "<@U1> 再 cc" : "<@U1> test");
     expect(description).not.toContain("spoofed");
   });
 });

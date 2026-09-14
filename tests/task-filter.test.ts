@@ -1,5 +1,21 @@
 import { describe, expect, it } from "vitest";
-import { isPrReviewRequest, taskFilter } from "../src/task-filter.js";
+import { hasThreadReviewContext, isThreadReviewFollowup, isPrReviewRequest, taskFilter } from "../src/task-filter.js";
+
+describe("thread review shorthand", () => {
+  it.each(["<!subteam^S1> 再 cc", "<@U1> 帮忙看看", "<@U1> 再 review 一下", "<@U1> 已修改，请复审", "<@U1> please review again"])("allows contextual lookup for %s", text => {
+    expect(isThreadReviewFollowup(text)).toBe(true);
+    expect(isPrReviewRequest(text)).toBe(false);
+  });
+  it.each(["<@U1>", "<@U1> FYI", "<@U1> 不用再 cc", "<@U1> 不用 review", "<@U1> 已合并，再 cc", "<@U1> review 已完成", "<@U1> review 设计稿", "<@U1> 帮忙看看报错", "<@U1> 部署后再 cc", "<@U1> `再 cc` 是例子", "<@U1>\n> 再 cc", "<@U1> review https://example.test"])("rejects %s", text => {
+    expect(isThreadReviewFollowup(text)).toBe(false);
+  });
+  it("requires a concrete earlier PR request, excluding quoted or misleading URLs", () => {
+    expect(hasThreadReviewContext(["帮忙看看 PR：<https://github.com/org/repo/pull/123>"])).toBe(true);
+    for (const text of ["review PR", "review PR `https://github.com/org/repo/pull/123`", "review PR https://github.com.evil.test/org/repo/pull/123", "不用 review https://github.com/org/repo/pull/123", "review 设计稿", "https://github.com/org/repo/pull/123"]) {
+      expect(hasThreadReviewContext([text])).toBe(false);
+    }
+  });
+});
 
 describe("PR review admission", () => {
   it.each([
