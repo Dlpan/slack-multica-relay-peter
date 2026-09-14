@@ -46,7 +46,7 @@ footer 表示消费消息时读取的 **Agent 配置快照**，不是运行实�
 
 使用专用 App 或明确获准复用的 App 接收需要的 message 事件。私有频道订阅 `message.groups`，并将接收 App 加入指定频道。接收事件的 App 身份与外发身份分开配置：`SLACK_REACTION_TOKEN` 和 Agent 回复使用获准的 owner USER token。验收时核对 `reaction.users` 和回复消息的 `user` 是否等于 owner ID。
 
-配置 Request URL 为 `https://<当前部署>/api/slack/events`，对应 Signing Secret 填入部署环境。新增 scopes 后重新安装。只修改已授权用于 Relay 的 App。
+配置 Request URL 为 `https://<当前部署>/api/slack/events`，对应 Signing Secret 填入部署环境。新增 scopes 后重新安装。 截图/附件读取需要 User Token 的 `files:read`；它仅覆盖该 User 已有访问权的文件。重新授权后验证实际执行凭据的 scope，若返回新 Token，则同步到 Agent 与 Relay 的既有 Secret 位置并重新部署 Relay，不能只看 App 配置列表。权限待批或附件暂不可读时仍应继续不依赖附件的 PR Review，并说明验证限制。只修改已授权用于 Relay 的 App。
 
 `SLACK_TEAM_ID`、`SLACK_TARGET_USER_IDS` 和 `SLACK_TARGET_SUBTEAM_IDS` 至少一个必填；`SLACK_ALLOWED_CHANNEL_IDS` 保留为白名单配置，默认使用 `all`，也可填写逗号分隔的频道 ID。`SLACK_BLOCKED_CHANNEL_IDS`、`SLACK_ALLOWED_SENDER_IDS` 和 `SLACK_BLOCKED_SENDER_IDS` 可选，黑名单优先于白名单。后续问答仍需再次 mention。
 
