@@ -8,6 +8,7 @@ import {
   getSlackReplyContext,
   type ApiConfig,
 } from "./multica-api.js";
+import type { TaskFilter } from "./task-filter.js";
 import type { MentionMatch } from "./mentions.js";
 import { type ThreadStore } from "./thread-store.js";
 import {
@@ -29,6 +30,8 @@ export interface SlackThreadEvent {
 }
 export interface ThreadRouterConfig extends ApiConfig {
   store: ThreadStore;
+  taskFilter?: TaskFilter;
+  slackReactionName?: string;
 }
 interface ThreadState {
   version: 2;
@@ -59,6 +62,11 @@ export async function routeSlackThreadEvent(
   config: ThreadRouterConfig,
   fetchImpl: typeof fetch = fetch,
 ): Promise<ThreadRouteResult> {
+  // Derive execution policy from consumer configuration, never from Slack payload.
+  const taskPolicy = config.taskFilter === "pr_review" ? {
+    source: "relay_config" as const, mode: "pr_review" as const,
+    reactionName: config.slackReactionName ?? "eyes",
+  } : undefined;
   const scope = digest(
     config.multicaWorkspaceId +
       ":" +
@@ -115,7 +123,7 @@ export async function routeSlackThreadEvent(
           const created = await createIssue(
             config,
             formatTaskTitle(event, scope),
-            formatTaskDescription(event, marker, false, replyContext),
+            formatTaskDescription(event, marker, false, replyContext, taskPolicy),
             fetchImpl,
           );
           state.issueId = created.id;
@@ -174,7 +182,7 @@ export async function routeSlackThreadEvent(
         await createComment(
           config,
           state.issueId,
-          formatTaskDescription(event, messageMarker, true, replyContext),
+          formatTaskDescription(event, messageMarker, true, replyContext, taskPolicy),
           fetchImpl,
         );
       } catch (error) {

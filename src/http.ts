@@ -15,8 +15,6 @@ import {
   type SlackThreadEvent,
 } from "./thread-router.js";
 import { UpstashThreadStore } from "./thread-store.js";
-import { isPrReviewRequest, isThreadReviewFollowup } from "./task-filter.js";
-import { readThreadReviewContext } from "./thread-context.js";
 
 export function json(value: unknown, status = 200): Response {
   return Response.json(value, { status });
@@ -50,8 +48,6 @@ function admitted(event: SlackThreadEvent, config: RelayConfig): boolean {
     (config.allowAllSenders || config.allowedSenderIds.has(event.senderUserId)) &&
     !config.blockedSenderIds.has(event.senderUserId) &&
     (!event.sourceAppId || config.allowedAppActors.has(`${event.sourceAppId}:${event.senderUserId}`)) &&
-    (config.taskFilter === "all" || isPrReviewRequest(event.text)
-      || (event.threadTs !== event.messageTs && isThreadReviewFollowup(event.text))) &&
     !!findTargetMention(
       event.text,
       config.targetUserIds,
@@ -100,8 +96,6 @@ function reason(error: unknown): string {
     "multica_http_error",
     "invalid_multica_response",
     "invalid_comment_cursor",
-    "slack_thread_unavailable",
-    "slack_thread_limit",
   ];
   return error instanceof Error && codes.includes(error.message)
     ? error.message
@@ -274,10 +268,6 @@ export async function consumeQueue(
       signal: init.signal ? AbortSignal.any([init.signal, deadline]) : deadline,
     });
   try {
-    if (config.taskFilter === "pr_review" && !isPrReviewRequest(event.text)
-      && !await readThreadReviewContext(event, config, boundedFetch)) {
-      return json({ action: "ignored", reason: "no_thread_review_context" });
-    }
     const result = await routeSlackThreadEvent(
       event,
       {
@@ -291,7 +281,9 @@ export async function consumeQueue(
       boundedFetch,
     );
     try {
-      await addSlackReaction(
+      // PR-only tasks are still awaiting semantic triage. The Agent reacts
+      // after reading the thread and confirming a review request.
+      if (config.taskFilter !== "pr_review") await addSlackReaction(
         config.slackReactionToken,
         event.channelId,
         event.messageTs,

@@ -109,6 +109,24 @@ describe("direct Issue routing", () => {
     return JSON.parse(description.match(/```json\n([\s\S]*?)\n```/)![1]!);
   }
 
+  it("applies the current PR-only scope to an existing thread without duplicating a message", async () => {
+    const f = fixture();
+    await routeSlackThreadEvent(root, f.config, f.fetcher);
+    expect(payload(f.issues[0]!.description)).not.toHaveProperty("taskPolicy");
+    f.config.taskFilter = "pr_review";
+    f.config.slackReactionName = "eyes";
+    const next = { ...root, messageTs: "102.000001", text: "<@U1> 已按你的建议调整", taskPolicy: { mode: "all" } };
+    await routeSlackThreadEvent(next, f.config, f.fetcher);
+    await routeSlackThreadEvent(next, f.config, f.fetcher);
+    expect(f.issuePosts).toBe(1);
+    expect(f.commentPosts).toBe(1);
+    expect(payload(f.comments[0]!.content)).toMatchObject({
+      eventPayload: { text: next.text, threadTs: root.threadTs },
+      taskPolicy: { source: "relay_config", mode: "pr_review", reactionName: "eyes" },
+    });
+    expect(payload(f.comments[0]!.content).eventPayload).not.toHaveProperty("taskPolicy");
+  });
+
   it("attaches a fresh configuration snapshot to each new message, not each duplicate", async () => {
     const f = fixture();
     await routeSlackThreadEvent(root, f.config, f.fetcher);
