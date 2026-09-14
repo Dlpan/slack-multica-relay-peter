@@ -21,7 +21,7 @@
 
 设置 `SLACK_TASK_FILTER=pr_review`，同时保留目标用户 ID 校验。若需让所有可接收事件的频道、所有发送者都能发起请求，可将 `SLACK_ALLOWED_CHANNEL_IDS` 和 `SLACK_ALLOWED_SENDER_IDS` 设为 `all`。此设置不会扩大 Slack App 自身的访问权限。
 
-触发消息本身必须同时包含 PR 线索（`PR`、`pull request`、合并请求或 GitHub PR 链接）和评审意图（`review`、`CR`、审查、评审、审核、看下等）。例如 `@Peter 请 review https://github.com/org/repo/pull/123`；普通提及、只贴链接、仅要求合并、明确不用评审或已完成评审的消息会被忽略。代码片段、引用消息及链接标签不参与意图判断；不会读取父消息补全 PR 线索，复审时请写明 `重新 review PR #123`。
+独立消息须同时包含 PR 线索（`PR`、`pull request`、合并请求或 GitHub PR 链接）和评审意图（`review`、`CR`、审查、评审、审核、看下等）。例如 `@Peter 请 review https://github.com/org/repo/pull/123`。thread 内支持 `@Peter 再 cc`、`@评审组 帮忙看看`、`@Peter 再 review 一下`、`@Peter 已修改，请复审` 等简短交回请求：当前消息仍必须命中目标 mention，消费者会从同一 thread 的更早消息中查找包含真实 GitHub PR 链接的评审请求，补齐 PR 上下文后才创建或续接任务。普通提及、仅同步、仅要求合并、明确不用评审和已完成/已合并通知仍被忽略；代码片段、引用和链接标签不参与意图判断。
 
 过滤在入队前和消费时均执行，策略变更后旧队列消息也须满足当前规则。默认 `all` 保持原行为；未知配置值会拒绝处理。这里是保守的文本规则，并非完整语义识别，Agent 仍须核对实际请求，只执行 PR review，非评审请求保持静默。启用时先部署过滤代码与 Agent 规则，再开放频道和发送者范围；回滚到旧代码前先恢复受限范围。
 
@@ -58,3 +58,9 @@ pnpm lint
 | 消费503                 | 保留队列重试/DLQ责任，原因包括 timeout、thread*lock_busy、ambiguous*\* |
 
 `GET /api/health` 仅证明函数可响应。消费有45秒整体预算，部署函数上限60秒；入站发布请求超时2秒。平台冷启动、网络延迟与配额仍须实测。
+
+### thread 上下文读取与 Agent 配套规则
+
+上下文读取使用 `SLACK_REACTION_TOKEN` 对应的 User 身份，需要目标会话的 history 权限。读取放在 QStash 消费阶段，Slack 收件确认只等待入队。只查询当前频道、当前 thread 和触发消息之前的记录，最多读取 3 页、每页 100 条，忽略未允许的应用消息与被阻止的发送者。读取失败、限流或分页超过上限返回可重试错误；没有匹配的历史 PR Review 请求则忽略，不建卡、不加 reaction。
+
+`eventPayload.text` 始终保留原始简写，Agent 必须重新读取 thread 判断真实意图和准确 PR；不能把所有 thread mention 当成复审。自定义 Agent Prompt 也需移除“当前消息必须独立带 PR 线索”的限制，明确允许在已有 PR Review thread 中由当前 `再 cc`、`再 review` 或类似交回请求补齐目标。当前消息明确不用评审、仅同步已合并或征求真人批准时仍保持静默。👀 在任务成功交给 Multica 后添加，表示接收而非评审完成。
