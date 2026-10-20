@@ -281,9 +281,9 @@ export async function consumeQueue(
       boundedFetch,
     );
     try {
-      // PR-only tasks are still awaiting semantic triage. The Agent reacts
-      // after reading the thread and confirming a review request.
-      if (config.taskFilter !== "pr_review") await addSlackReaction(
+      // Scoped tasks await semantic triage. The Agent owns the PR or ticket
+      // reaction lifecycle after confirming the current request.
+      if (config.taskFilter === "all") await addSlackReaction(
         config.slackReactionToken,
         event.channelId,
         event.messageTs,

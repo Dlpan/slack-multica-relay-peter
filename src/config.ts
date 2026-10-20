@@ -2,6 +2,7 @@ import { taskFilter, type TaskFilter } from "./task-filter.js";
 
 export interface RelayConfig {
   taskFilter: TaskFilter;
+  ticketOwnerUserId?: string;
   allowedAppActors: Set<string>;
   signingSecret: string;
   teamId: string;
@@ -39,8 +40,14 @@ export function loadRelayConfig(
   const targetSubteamIds = ids(env.SLACK_TARGET_SUBTEAM_IDS);
   if (!targetUserIds.size && !targetSubteamIds.size)
     throw new Error("missing_mention_target");
+  const filter = taskFilter(env.SLACK_TASK_FILTER);
+  const ticketOwnerUserId = env.RELAY_OWNER_SLACK_USER_ID?.trim();
+  if (filter === "pr_review_and_ticket" &&
+      (!ticketOwnerUserId || !/^[UW][A-Z0-9]+$/u.test(ticketOwnerUserId) || !targetUserIds.has(ticketOwnerUserId)))
+    throw new Error("invalid_ticket_owner");
   return {
-    taskFilter: taskFilter(env.SLACK_TASK_FILTER),
+    taskFilter: filter,
+    ticketOwnerUserId,
     allowedAppActors: appActors(env.SLACK_ALLOWED_APP_ACTORS),
     signingSecret: required(env, "SLACK_SIGNING_SECRET"),
     teamId: required(env, "SLACK_TEAM_ID"),

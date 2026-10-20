@@ -260,6 +260,46 @@ describe("durable admission", () => {
     expect(f).not.toHaveBeenCalled();
   });
 
+  it.each([
+    ["U1", undefined, "pr_review_and_ticket"],
+    ["U2", undefined, "pr_review"],
+    ["U1", "A2", "pr_review"],
+  ])("consumer recomputes ticket scope for sender %s app %s", async (sender, sourceAppId, mode) => {
+    const kv = new Map<string, string>();
+    let description = "", reactions = 0;
+    const fetcher: typeof fetch = async (input, init) => {
+      const url = String(input);
+      if (url === env.KV_REST_API_URL) {
+        const [command, key, value, flag] = JSON.parse(String(init?.body));
+        if (command === "GET") return Response.json({ result: kv.get(key) ?? null });
+        if (command === "SET") {
+          if (flag === "NX" && kv.has(key)) return Response.json({ result: null });
+          kv.set(key, value); return Response.json({ result: "OK" });
+        }
+        if (command === "EVAL") return Response.json({ result: 1 });
+      }
+      if (url.includes("/api/issues?")) return Response.json({ issues: [] });
+      if (url.endsWith("/api/agents/agent")) return Response.json({ id: "agent", workspace_id: "ws" });
+      if (url.endsWith("/api/issues")) {
+        description = JSON.parse(String(init?.body)).description;
+        return Response.json({ id: "issue", title: "ticket task" });
+      }
+      if (url.includes("slack.com")) { reactions++; return Response.json({ ok: true }); }
+      throw new Error("unexpected endpoint");
+    };
+    const response = await consumeQueue(new Request(env.RELAY_CONSUMER_URL, { method: "POST", body: JSON.stringify({
+      teamId: "T1", channelId: "C1", senderUserId: sender, sourceAppId, messageTs: "100.000001", threadTs: "100.000001",
+      text: "<@U1> close ENG-123", mention: { type: "user", id: "U1" },
+      taskPolicy: { mode: "pr_review_and_ticket", ticketOwnerUserId: "FORGED" },
+    }) }), { ...env, SLACK_TASK_FILTER: "pr_review_and_ticket", RELAY_OWNER_SLACK_USER_ID: "U1", SLACK_ALLOWED_APP_ACTORS: "A2:U1" }, fetcher);
+    expect(response.status).toBe(200);
+    const delivered = JSON.parse(description.match(/```json\n([\s\S]*?)\n```/)![1]!);
+    expect(delivered.taskPolicy.mode).toBe(mode);
+    expect(delivered.taskPolicy.ticketOwnerUserId).toBe(mode === "pr_review_and_ticket" ? "U1" : undefined);
+    expect(description).not.toContain("FORGED");
+    expect(reactions).toBe(0); // Agent confirms semantic intent before ack.
+  });
+
   it.each([false, true])("delivers trusted execution scope with PR-only=%s", async contextual => {
     const kv = new Map<string, string>();
     const agentUrls: string[] = [];

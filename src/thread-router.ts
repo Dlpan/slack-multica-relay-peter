@@ -9,7 +9,7 @@ import {
   type ApiConfig,
 } from "./multica-api.js";
 import type { TaskFilter } from "./task-filter.js";
-import type { MentionMatch } from "./mentions.js";
+import { findTargetMention, type MentionMatch } from "./mentions.js";
 import { type ThreadStore } from "./thread-store.js";
 import {
   formatTaskTitle,
@@ -32,6 +32,7 @@ export interface ThreadRouterConfig extends ApiConfig {
   store: ThreadStore;
   taskFilter?: TaskFilter;
   slackReactionName?: string;
+  ticketOwnerUserId?: string;
 }
 interface ThreadState {
   version: 2;
@@ -63,9 +64,17 @@ export async function routeSlackThreadEvent(
   fetchImpl: typeof fetch = fetch,
 ): Promise<ThreadRouteResult> {
   // Derive execution policy from consumer configuration, never from Slack payload.
-  const taskPolicy = config.taskFilter === "pr_review" ? {
-    source: "relay_config" as const, mode: "pr_review" as const,
+  const ticketEligible = config.taskFilter === "pr_review_and_ticket"
+    && !!config.ticketOwnerUserId
+    && event.senderUserId === config.ticketOwnerUserId
+    && !event.sourceAppId
+    && !!findTargetMention(event.text, new Set([config.ticketOwnerUserId]), new Set());
+  const taskPolicy = config.taskFilter === "pr_review" || config.taskFilter === "pr_review_and_ticket" ? {
+    source: "relay_config" as const,
+    mode: ticketEligible ? "pr_review_and_ticket" as const : "pr_review" as const,
     reactionName: config.slackReactionName ?? "eyes",
+    ...(ticketEligible ? { ticketOwnerUserId: config.ticketOwnerUserId, ticketReactionName: "ack" as const,
+      ticketCompletedReactionName: "white_check_mark" as const } : {}),
   } : undefined;
   const scope = digest(
     config.multicaWorkspaceId +
