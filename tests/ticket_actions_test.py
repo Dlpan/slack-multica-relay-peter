@@ -200,6 +200,18 @@ class TicketActionsTest(unittest.TestCase):
         self.plan['actions']=['reply']
         self.assertEqual(self.execute()['completed'],['reply'])
         self.assertEqual(len(self.api.writes),1)
+    def test_comment_operation_property_is_a_json_object(self):
+        original=self.api.jira
+        def jira(path,method='GET',body=None):
+            if method=='POST' and path.endswith('/comment'):
+                if not isinstance(body['properties'][0]['value'],dict):raise t.Blocked('http_400')
+            return original(path,method,body)
+        self.api.jira=jira;self.plan['actions']=['reply']
+        self.assertEqual(self.execute()['completed'],['reply'])
+        prop=self.api.writes[0][1]['properties'][0]
+        self.assertEqual(prop['key'],'slack-ticket-action')
+        self.assertRegex(prop['value']['operationId'],r'^[0-9a-f]{64}$')
+        self.execute();self.assertEqual(len(self.api.writes),1)
     def test_other_sender_and_app_and_changed_message_rejected_before_ack(self):
         for change in [dict(user='U2'),dict(app_id='A1'),dict(bot_id='B1'),dict(text='<@U1> do not close ENG-123')]:
             with self.subTest(change=change):
@@ -527,6 +539,13 @@ class BugWorkflowTest(unittest.TestCase):
         self.assertEqual(t.text_of(self.api.issue['fields']['root']),'Existing cause.')
 
 class ApiTransportTest(unittest.TestCase):
+    def test_property_json_rejection_is_classified_without_echoing_value(self):
+        raw=json.dumps({'errorMessages':["The JSON data provided for the property is not a valid JSON: EntityPropertyBean{key='slack-ticket-action', value='private-value'}."],'errors':{}}).encode()
+        details=t.validation_details(raw)
+        self.assertEqual(details['categories'],['invalid_property'])
+        self.assertNotIn('private-value',json.dumps(details))
+        notice=t.failure_text({'issue':'ENG-123','completed':['close'],'errors':{'reply':'http_400'},'validation':{'reply':details}})
+        self.assertIn('附加属性 JSON 格式无效',notice)
     def test_failure_notice_attributes_both_actions_and_no_field_message(self):
         result={'issue':'ENG-123','completed':[],'errors':{'reply':'http_400','close':'http_400'},
                 'validation':{'reply':{'categories':['invalid_document'],'fields':{}},

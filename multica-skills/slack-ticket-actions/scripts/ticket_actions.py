@@ -86,6 +86,8 @@ def validation_details(raw):
         if not isinstance(message, str):
             return "rejected"
         text = message.casefold()
+        if "property" in text and any(word in text for word in ("not a valid json", "invalid json")):
+            return "invalid_property"
         if any(word in text for word in ("atlassian document", "valid document", "adf")):
             return "invalid_document"
         if any(word in text for word in ("required", "must specify", "mandatory")):
@@ -577,7 +579,7 @@ def execute_plan(api, event, plan, journal, execute=False):
                     else:
                         require(not previous or previous["phase"] != "writing", "ambiguous_comment_write")
                         created = post_recorded(api, journal, key, digest, f"issue/{issue['id']}/comment",
-                            {"body": adf(plan["comment"]), "properties": [{"key": "slack-ticket-action", "value": operation}]})
+                            {"body": adf(plan["comment"]), "properties": [{"key": "slack-ticket-action", "value": {"operationId": operation}}]})
                         saved = api.jira(f"issue/{issue['id']}/comment/{created['id']}")
                         require(saved.get("author", {}).get("accountId") == actor and text_of(saved.get("body")) == plan["comment"],
                                 "comment_verification_failed")
@@ -651,6 +653,7 @@ def failure_text(result):
         completed.append("已流转至 " + steps[-1]["status"] + "（关闭尚未完成）")
     labels = {"reply": "回复 #intercom", "close": "关闭工单", "preflight": "执行前校验"}
     categories = {"invalid_document": "富文本格式不符合 ADF", "required": "缺少必填值",
+                  "invalid_property": "附加属性 JSON 格式无效",
                   "not_editable": "字段当前不可写", "invalid_option": "选项无效", "rejected": "校验未通过"}
     failures = []
     for action, code in result.get("errors", {}).items():
