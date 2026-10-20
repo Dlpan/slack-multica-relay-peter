@@ -20,7 +20,9 @@ import urllib.request
 
 
 class Blocked(Exception):
-    pass
+    def __init__(self, code, details=None):
+        super().__init__(code)
+        self.details = details
 
 
 def require(condition, code):
@@ -72,6 +74,37 @@ def adf(text):
         {"type": "paragraph", "content": []} for line in text.split("\n")]}
 
 
+def validation_details(raw):
+    """Retain field IDs and fixed error categories, never server/customer text."""
+    try:
+        data = json.loads(raw)
+    except (ValueError, UnicodeError):
+        return None
+    if not isinstance(data, dict):
+        return None
+    def category(message):
+        if not isinstance(message, str):
+            return "rejected"
+        text = message.casefold()
+        if any(word in text for word in ("atlassian document", "valid document", "adf")):
+            return "invalid_document"
+        if any(word in text for word in ("required", "must specify", "mandatory")):
+            return "required"
+        if any(word in text for word in ("cannot be set", "not on the appropriate screen", "not editable")):
+            return "not_editable"
+        if any(word in text for word in ("option", "allowed value")):
+            return "invalid_option"
+        return "rejected"
+    fields = data.get("errors", {})
+    messages = data.get("errorMessages", [])
+    system_fields = {"body", "comment", "properties", "resolution", "transition", "status", "summary", "description",
+                     "environment", "assignee", "reporter", "priority", "components", "labels", "fixVersions", "versions"}
+    safe = {"fields": {key: category(value) for key, value in fields.items()
+                        if re.fullmatch(r"customfield_\d+", key) or key in system_fields}} if isinstance(fields, dict) else {"fields": {}}
+    safe["categories"] = sorted({category(message) for message in messages}) if isinstance(messages, list) else []
+    return safe if safe["fields"] or safe["categories"] else None
+
+
 class Api:
     def __init__(self, env=None):
         env = dict(os.environ if env is None else env)
@@ -113,8 +146,13 @@ class Api:
                 raw = response.read()
                 return json.loads(raw) if raw else {}
         except urllib.error.HTTPError as exc:
-            # Do not expose bodies which can contain customer data or credentials.
-            raise Blocked(f"http_{exc.code}") from None
+            details = None
+            try:
+                if exc.code == 400 and url.startswith(self.base + "/rest/api/3/"):
+                    details = validation_details(exc.read(65536))
+            finally:
+                exc.close()
+            raise Blocked(f"http_{exc.code}", details) from None
         except (urllib.error.URLError, TimeoutError, json.JSONDecodeError):
             raise Blocked("network_or_response_unknown") from None
 
@@ -264,6 +302,11 @@ def transition_fields(issue, selected, supplied, required_names=()):
         required_ids.add(ids[0])
     patch = {}
     for field, value in supplied.items():
+        if isinstance(value, str) and screen[field].get("schema", {}).get("custom", "").endswith(":textarea"):
+            value = adf(value)
+        if not empty(fields.get(field)) and isinstance(value, dict) and value.get("type") == "doc" \
+                and text_of(fields[field]) == text_of(value):
+            value = fields[field]
         require(empty(fields.get(field)) or matches(fields.get(field), value), "existing_field_would_change")
         if not matches(fields.get(field), value):
             english(value)
@@ -354,7 +397,8 @@ def verify_codex_evidence(item, issue):
         client = Codex()
         turns = list(pages(client, "thread/turns/list", {"threadId": item["threadId"],
             "limit": 50, "itemsView": "full", "sortDirection": "asc"}))
-        require(any(re.search(r"(?<![A-Z0-9_])" + re.escape(issue) + r"(?![A-Z0-9_])", item_text(record), re.I)
+        keys = [issue] if isinstance(issue, str) else issue
+        require(any(any(re.search(r"(?<![A-Z0-9_])" + re.escape(key) + r"(?![A-Z0-9_])", item_text(record), re.I) for key in keys)
                     for turn in turns for record in turn.get("items", [])
                     if record.get("type") in ("userMessage", "agentMessage")), "codex_ticket_mismatch")
         require(any(turn["id"] == item.get("turnId") and record.get("id") == item.get("itemId")
@@ -367,7 +411,7 @@ def verify_codex_evidence(item, issue):
             client.close()
 
 
-def validate_reply(plan, messages):
+def validate_reply(plan, messages, issue_keys=None):
     roots = plan.get("rootCause", {})
     require(roots.get("confirmed") is True and bool(roots.get("summary", "").strip()), "root_cause_not_confirmed")
     evidence = roots.get("evidence", [])
@@ -379,7 +423,7 @@ def validate_reply(plan, messages):
                         for m in messages), "slack_evidence_mismatch")
         else:
             require(all(item.get(k) for k in ("threadId", "turnId", "itemId")), "codex_evidence_reference_required")
-            verify_codex_evidence(item, plan["issue"])
+            verify_codex_evidence(item, issue_keys or plan["issue"])
     body = plan.get("comment", "")
     require(isinstance(body, str) and body.startswith("#intercom\n") and bool(body[len("#intercom\n"):].strip()), "intercom_comment_required")
     english(body)
@@ -395,12 +439,13 @@ def post_recorded(api, journal, key, digest, path, body, intent=None):
         raise
 
 
-def close_ticket(api, event, plan, journal, key, digest, execute):
+def close_ticket(api, event, plan, journal, key, digest, execute, issue_id):
     prior = journal.get(key)
     progress = prior["receipt"] if prior and prior["phase"] == "workflow" else {"steps": []}
     for _ in range(4):
         verified_thread(api, event)
-        fresh = api.jira("issue/" + plan["issue"])
+        fresh = api.jira("issue/" + issue_id)
+        require(fresh.get("id") == issue_id, "jira_issue_mismatch")
         if execute and progress.get("active"):
             step_key = progress["active"]
             step = journal.get(step_key)
@@ -451,17 +496,28 @@ def close_ticket(api, event, plan, journal, key, digest, execute):
     raise Blocked("workflow_step_limit")
 
 
+def resolve_issue(api, plan, messages):
+    source = plan.get("sourceIssue", plan["issue"])
+    require(isinstance(source, str) and bool(re.fullmatch(r"[A-Z][A-Z0-9_]*-\d+", source)), "invalid_issue_key")
+    require(any(re.search(r"(?<![A-Z0-9_])" + re.escape(source) + r"(?![A-Z0-9_])", m.get("text", ""), re.I)
+                for m in messages), "ticket_not_in_slack_thread")
+    issue = api.jira("issue/" + plan["issue"])
+    require(bool(re.fullmatch(r"[A-Z][A-Z0-9_]*-\d+", issue.get("key", ""))) and str(issue.get("id", "")).isdigit(),
+            "jira_issue_mismatch")
+    if source != plan["issue"]:
+        original = api.jira("issue/" + source)
+        require(original.get("id") == issue["id"] and original.get("key") == issue["key"], "jira_alias_mismatch")
+    return issue
+
+
 def execute_plan(api, event, plan, journal, execute=False):
     messages = verified_thread(api, event)
     actions = validate_request(plan, event)
-    require(any(re.search(r"(?<![A-Z0-9_])" + re.escape(plan["issue"]) + r"(?![A-Z0-9_])", m.get("text", ""), re.I)
-                for m in messages), "ticket_not_in_slack_thread")
     actor = api.jira("myself")["accountId"]
     require(bool(api.jira_account) and actor == api.jira_account, "jira_actor_mismatch")
-    issue = api.jira("issue/" + plan["issue"])
-    require(issue.get("key") == plan["issue"] and str(issue.get("id", "")).isdigit(), "jira_issue_mismatch")
+    issue = resolve_issue(api, plan, messages)
     operation = fingerprint([api.base, event["teamId"], event["channelId"], event["messageTs"], issue["id"]])
-    result = {"issue": issue["key"], "dry_run": not execute, "completed": [], "receipts": {}, "errors": {}}
+    result = {"issue": issue["key"], "issueId": issue["id"], "dry_run": not execute, "completed": [], "receipts": {}, "errors": {}}
     with journal.lock([api.base, issue["id"]]):
         for action in actions:
             key = operation + ":" + action
@@ -481,7 +537,7 @@ def execute_plan(api, event, plan, journal, execute=False):
                     result["receipts"][action] = previous["receipt"]
                     continue
                 if action == "reply":
-                    validate_reply(plan, messages)
+                    validate_reply(plan, messages, {plan["issue"], issue["key"], plan.get("sourceIssue", plan["issue"])})
                     if not execute:
                         result["receipts"][action] = {"ready": True, "comment": plan["comment"]}
                         continue
@@ -498,7 +554,7 @@ def execute_plan(api, event, plan, journal, execute=False):
                                 "comment_verification_failed")
                         receipt = {"commentId": saved["id"], "verified": True}
                 else:
-                    receipt = close_ticket(api, event, plan, journal, key, digest, execute)
+                    receipt = close_ticket(api, event, plan, journal, key, digest, execute, issue["id"])
                     if not execute:
                         result["receipts"][action] = receipt
                         continue
@@ -507,6 +563,8 @@ def execute_plan(api, event, plan, journal, execute=False):
                 result["receipts"][action] = receipt
             except Blocked as exc:
                 result["errors"][action] = str(exc)
+                if exc.details:
+                    result.setdefault("validation", {})[action] = exc.details
                 if action == "close":
                     state = journal.get(key)
                     if state and state["phase"] == "workflow":
@@ -533,6 +591,7 @@ def explain(code):
         "http_401": "Jira 身份认证失败，需要更新授权配置",
         "http_403": "当前 Jira 身份没有执行权限，需要检查项目权限或工作流限制",
         "ticket_lock_busy": "另一个任务正在处理同一 ticket，请等待该任务结束后再重试",
+        "jira_alias_mismatch": "Slack 中的旧编号与目标编号未解析到同一 Jira issue，未执行",
     }
     if code.startswith("missing_required_field:"):
         return "Jira 必填字段 " + code.split(":", 1)[1] + " 缺少可确认的值，请补充该字段信息"
@@ -554,6 +613,10 @@ def failure_text(result):
     if steps and "close" not in result.get("completed", []):
         completed.append("已流转至 " + steps[-1]["status"] + "（关闭尚未完成）")
     reasons = "；".join(explain(code) for code in result.get("errors", {}).values())
+    for action, detail in result.get("validation", {}).items():
+        fields = ", ".join(field + ": " + code for field, code in detail.get("fields", {}).items())
+        if fields:
+            reasons += "；" + action + " 字段校验：" + fields
     current = result.get("receipts", {}).get("close", {}).get("currentStatus")
     if current:
         reasons = "工单当前状态为 " + current + "；" + reasons
@@ -586,17 +649,19 @@ def finalize_failure(api, event, plan, journal):
     """Publish the final blocker only; never submit Jira comments/transitions."""
     with journal.lock(["event", api.base, event.get("teamId"), event.get("channelId"), event.get("messageTs")],
                       "same_message_running"):
-        verified_thread(api, event)
+        messages = verified_thread(api, event)
         validate_request(plan, event)
         saved = journal.get(outcome_key(api, event, plan))
         require(saved and saved["digest"] == fingerprint(plan), "current_execution_result_required")
         result = saved["receipt"]
         require("error" in result, "failure_finalization_requires_error")
         require(api.jira("myself").get("accountId") == api.jira_account and bool(api.jira_account), "jira_actor_mismatch")
-        issue = api.jira("issue/" + plan["issue"])
-        require(issue.get("key") == plan["issue"] and str(issue.get("id", "")).isdigit(), "jira_issue_mismatch")
+        issue = resolve_issue(api, plan, messages)
+        require(issue["id"] == result.get("issueId", issue["id"]), "jira_issue_mismatch")
         with journal.lock([api.base, issue["id"]]):
-            issue = api.jira("issue/" + plan["issue"])
+            fresh = api.jira("issue/" + issue["id"])
+            require(fresh.get("id") == issue["id"], "jira_issue_mismatch")
+            issue = fresh
             if "close" in result.get("errors", {}):
                 require(issue["fields"]["status"]["name"].casefold() not in ("closed", "resolved"),
                         "outcome_needs_reconciliation")
@@ -637,6 +702,8 @@ def _run(api, event, plan, journal, execute=False):
         result = execute_plan(api, event, plan, journal, True)
     except Blocked as exc:
         result = {"issue": plan.get("issue"), "error": str(exc), "completed": [], "errors": {"preflight": str(exc)}}
+        if exc.details:
+            result["validation"] = {"preflight": exc.details}
     result["notification_pending"] = "error" in result
     journal.put(outcome_key(api, event, plan), fingerprint(plan), "done", result)
     if "error" not in result:

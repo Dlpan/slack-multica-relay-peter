@@ -33,3 +33,7 @@
 | Bug 已到 In Testing，但缺少后续必要事实 | Agent 确认无法继续后 finalize-failure；说明已流转至 In Testing，不写“已完成：无” |
 | 写入响应超时但 Jira 实际已 Resolved | finalize-failure 拒绝旧失败通知；先运行 helper 对账 |
 | 同一触发消息已发最终失败，后续成功恢复 | 更正已记录的失败消息，不新增矛盾的失败文字 |
+| Slack 中旧编号已迁移，新编号未出现 | Jira 回读解析同一 issue ID 后继续，不要求 owner 重复指令 |
+| sourceIssue 与目标编号属于不同关联单 | jira_alias_mismatch，拒绝写入 |
+| 最终流转 Solution 为 textarea，plan 提供英文字符串 | 按实时 schema 转换 ADF；已有内容不覆盖 |
+| Jira 400 含字段错误和敏感原文 | 仅保留字段 ID 和固定校验类别，不输出原始错误正文 |

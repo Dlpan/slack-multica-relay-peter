@@ -1,9 +1,12 @@
 import copy
+import io
 import importlib.util
+import json
 from pathlib import Path
 import sys
 import tempfile
 import unittest
+import urllib.error
 from unittest.mock import patch
 
 SCRIPTS = Path(__file__).resolve().parents[1] / 'multica-skills/slack-ticket-actions/scripts'
@@ -92,6 +95,52 @@ class TicketActionsTest(unittest.TestCase):
         self.plan['issue']='ENG-999'
         self.assertEqual(self.execute()['error'],'ticket_not_in_slack_thread')
         self.assertFalse(self.api.writes)
+    def test_old_slack_key_resolves_to_canonical_issue_and_deduplicates(self):
+        self.api.issue['key']='NEW-456'
+        result=self.execute()
+        self.assertEqual(result['issue'],'NEW-456')
+        self.assertEqual(result['completed'],['reply','close'])
+        self.plan.update(issue='NEW-456',sourceIssue='ENG-123')
+        self.assertEqual(self.execute()['completed'],['reply','close'])
+        self.assertEqual(len(self.api.writes),2)
+    def test_canonical_target_accepts_only_server_verified_alias(self):
+        self.api.issue['key']='NEW-456';self.plan.update(issue='NEW-456',sourceIssue='ENG-123')
+        self.assertEqual(self.execute()['completed'],['reply','close'])
+    def test_source_key_of_different_issue_is_not_a_migration(self):
+        original=self.api.jira
+        def jira(path,*args):
+            result=original(path,*args)
+            if path=='issue/NEW-456':result.update(id='456',key='NEW-456')
+            return result
+        self.api.jira=jira;self.plan.update(issue='NEW-456',sourceIssue='ENG-123')
+        self.assertEqual(self.execute()['error'],'jira_alias_mismatch')
+        self.assertFalse(self.api.writes)
+    def test_unmentioned_source_alias_is_rejected(self):
+        self.plan['sourceIssue']='OLD-999'
+        self.assertEqual(self.execute()['error'],'ticket_not_in_slack_thread')
+        self.assertFalse(self.api.writes)
+    def test_terminal_textarea_normalizes_plain_text_to_adf(self):
+        self.plan['actions']=['close'];self.plan['fields']['solution']='Use the Closed conversation filter.'
+        self.api.transition['fields']['solution']={'name':'Solution','schema':{'custom':'jira:textarea'},'required':True}
+        self.assertEqual(self.execute()['completed'],['close'])
+        saved=self.api.writes[0][1]['fields']['solution']
+        self.assertEqual(saved['type'],'doc');self.assertEqual(t.text_of(saved),self.plan['fields']['solution'])
+    def test_same_text_existing_rich_text_is_preserved(self):
+        self.plan['actions']=['close'];self.plan['fields']['solution']='Existing solution.'
+        self.api.transition['fields']['solution']={'name':'Solution','schema':{'custom':'jira:textarea'}}
+        self.api.issue['fields']['solution']=t.adf('Existing solution.')
+        self.api.issue['fields']['solution']['content'][0]['content'][0]['marks']=[{'type':'strong'}]
+        self.assertEqual(self.execute()['completed'],['close'])
+        self.assertNotIn('solution',self.api.writes[0][1]['fields'])
+    def test_jira_validation_details_retain_only_safe_categories(self):
+        original=self.api.jira
+        def jira(path,method='GET',body=None):
+            if method=='POST':raise t.Blocked('http_400',{'fields':{'body':'invalid_document'},'categories':[]})
+            return original(path,method,body)
+        self.api.jira=jira;self.plan['actions']=['reply']
+        result=self.execute()
+        self.assertEqual(result['errors']['reply'],'http_400')
+        self.assertEqual(result['validation']['reply']['fields'],{'body':'invalid_document'})
     def test_close_requires_no_root_cause_or_deployment(self):
         self.plan['actions']=['close']; self.plan.pop('rootCause'); self.plan.pop('comment')
         self.assertEqual(self.execute()['completed'],['close'])
@@ -412,6 +461,21 @@ class BugWorkflowTest(unittest.TestCase):
         self.assertEqual(t.text_of(self.api.issue['fields']['root']),'Existing cause.')
 
 class ApiTransportTest(unittest.TestCase):
+    def test_http400_keeps_field_categories_without_server_text(self):
+        api=t.Api({'JIRA_LOGIN':'user','JIRA_API_TOKEN':'test-token'})
+        body={'errors':{'customfield_13710':'Must be a valid document. customer@example.com private-token',
+                        'resolution':'You must specify a resolution.'},
+              'errorMessages':['Customer secret at https://private.example/path?token=private-token']}
+        error=urllib.error.HTTPError(api.base+'/rest/api/3/issue/123/transitions',400,'Bad Request',{},io.BytesIO(json.dumps(body).encode()))
+        with patch.object(t.urllib.request,'build_opener') as opener:
+            opener.return_value.open.side_effect=error
+            with self.assertRaises(t.Blocked) as caught:api.jira('issue/123/transitions','POST',{})
+        self.assertEqual(str(caught.exception),'http_400')
+        details=caught.exception.details
+        self.assertEqual(details['fields'],{'customfield_13710':'invalid_document','resolution':'required'})
+        self.assertNotIn('private',json.dumps(details));self.assertNotIn('customer@',json.dumps(details))
+    def test_non_json_error_body_is_not_exposed(self):
+        self.assertIsNone(t.validation_details(b'<html>private-token</html>'))
     def test_slack_reads_use_query_parameters(self):
         api=t.Api({'SLACK_USER_TOKEN':'test-token'})
         with patch.object(api,'request',return_value={'ok':True}) as request:
