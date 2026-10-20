@@ -43,3 +43,4 @@
 | Bug Report 在 QA Investigating 可直接 Resolve Issue | 使用直接 Resolved 流转，不走 Bug Fixed/In Testing |
 | 管理员级 workflow validators 无权读取 | 预检标注 serverValidation=not_executed，不宣称服务端全校验通过 |
 | 评论/关闭同时 400，或仅有 errorMessages | 分别标注动作、展示安全类别；没有详情明确原因未知 |
+| 评论 property 被 Jira 拒绝为无效 JSON | 属性 value 使用含 operationId 的 JSON 对象；不改业务正文和工作流；已关闭动作不重复 |
