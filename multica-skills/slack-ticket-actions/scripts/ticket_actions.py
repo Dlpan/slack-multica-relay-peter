@@ -1,0 +1,486 @@
+#!/usr/bin/env python3
+"""Owner-only Slack ticket actions. Stdlib only; dry-run unless --execute."""
+import argparse
+import base64
+import contextlib
+import fcntl
+import hashlib
+import json
+import os
+from pathlib import Path
+import re
+import sqlite3
+import shlex
+import sys
+
+from codex_context import Codex, Unavailable, pages, item_text
+import urllib.error
+import urllib.parse
+import urllib.request
+
+
+class Blocked(Exception):
+    pass
+
+
+def require(condition, code):
+    if not condition:
+        raise Blocked(code)
+
+
+def fingerprint(value):
+    return hashlib.sha256(json.dumps(value, sort_keys=True, ensure_ascii=False).encode()).hexdigest()
+
+
+def text_of(value):
+    if isinstance(value, str):
+        return value
+    if isinstance(value, list):
+        return "\n".join(text_of(x) for x in value)
+    if isinstance(value, dict):
+        if value.get("type") == "text":
+            return value.get("text", "")
+        separator = "" if value.get("type") == "paragraph" else "\n"
+        return separator.join(text_of(x) for x in value.get("content", []))
+    return ""
+
+
+def matches(actual, expected):
+    if isinstance(expected, dict):
+        return isinstance(actual, dict) and all(k in actual and matches(actual[k], v) for k, v in expected.items())
+    if isinstance(expected, list):
+        return isinstance(actual, list) and len(actual) == len(expected) and all(matches(a, b) for a, b in zip(actual, expected))
+    return actual == expected
+
+
+def english(value):
+    # Semantic English quality is reviewed by the Agent; reject non-Latin prose here.
+    if isinstance(value, str):
+        require(not re.search(r"[\u3400-\u9fff\u3040-\u30ff\uac00-\ud7af\u0400-\u04ff]", value), "jira_content_must_be_english")
+    elif isinstance(value, dict):
+        for key, item in value.items():
+            if key not in ("id", "accountId", "key", "self"):
+                english(item)
+    elif isinstance(value, list):
+        for item in value:
+            english(item)
+
+
+def adf(text):
+    return {"type": "doc", "version": 1, "content": [
+        {"type": "paragraph", "content": [{"type": "text", "text": line}]} if line else
+        {"type": "paragraph", "content": []} for line in text.split("\n")]}
+
+
+class Api:
+    def __init__(self, env=None):
+        env = dict(os.environ if env is None else env)
+        # Explicit owner-local credential source; never load a task's CWD .env.
+        if env.get("TICKET_JIRA_ENV_FILE"):
+            path = Path(env["TICKET_JIRA_ENV_FILE"])
+            require(path.is_absolute() and path.is_file() and path.stat().st_uid == os.getuid(), "invalid_jira_env_file")
+            for line in path.read_text().splitlines():
+                key, sep, raw = line.partition("=")
+                key = key.strip().removeprefix("export ")
+                if sep and key in ("JIRA_BASE_URL", "JIRA_LOGIN", "JIRA_EMAIL", "JIRA_API_TOKEN", "JIRA_TOKEN"):
+                    values = shlex.split(raw, comments=True)
+                    if values and not env.get(key):
+                        env[key] = values[0]
+        self.slack_token = env.get("SLACK_USER_TOKEN", "")
+        self.owner = env.get("RELAY_OWNER_SLACK_USER_ID", "")
+        self.team = env.get("SLACK_TEAM_ID", "")
+        self.base = env.get("JIRA_BASE_URL", "https://moego.atlassian.net").rstrip("/")
+        parsed = urllib.parse.urlsplit(self.base)
+        require(parsed.scheme == "https" and parsed.hostname and not parsed.username
+                and not parsed.password and not parsed.query and not parsed.fragment and not parsed.path,
+                "invalid_jira_url")
+        login = env.get("JIRA_LOGIN") or env.get("JIRA_EMAIL", "")
+        token = env.get("JIRA_API_TOKEN") or env.get("JIRA_TOKEN", "")
+        self.jira_auth = "Basic " + base64.b64encode(f"{login}:{token}".encode()).decode()
+        self.jira_ready = bool(login and token)
+        self.jira_account = env.get("TICKET_JIRA_ACCOUNT_ID", "")
+
+    def request(self, url, method, body, authorization):
+        data = json.dumps(body).encode() if body is not None else None
+        request = urllib.request.Request(url, data=data, method=method,
+            headers={"Authorization": authorization, "Content-Type": "application/json", "Accept": "application/json"})
+        # Never follow a credential-bearing request to a different origin.
+        class NoRedirect(urllib.request.HTTPRedirectHandler):
+            def redirect_request(self, req, fp, code, msg, headers, newurl):
+                return None
+        try:
+            with urllib.request.build_opener(NoRedirect).open(request, timeout=25) as response:
+                raw = response.read()
+                return json.loads(raw) if raw else {}
+        except urllib.error.HTTPError as exc:
+            # Do not expose bodies which can contain customer data or credentials.
+            raise Blocked(f"http_{exc.code}") from None
+        except (urllib.error.URLError, TimeoutError, json.JSONDecodeError):
+            raise Blocked("network_or_response_unknown") from None
+
+    def slack(self, method, body):
+        require(bool(self.slack_token), "missing_slack_user_token")
+        url = "https://slack.com/api/" + method
+        if method in ("auth.test", "conversations.replies", "emoji.list"):
+            result = self.request(url + "?" + urllib.parse.urlencode(body), "GET", None, "Bearer " + self.slack_token)
+        else:
+            result = self.request(url, "POST", body, "Bearer " + self.slack_token)
+        require(result.get("ok") is True or result.get("error") in ("already_reacted", "no_reaction"),
+                "slack_" + str(result.get("error", "unknown")))
+        return result
+
+    def jira(self, path, method="GET", body=None):
+        require(self.jira_ready, "missing_jira_credentials")
+        return self.request(self.base + "/rest/api/3/" + path, method, body, self.jira_auth)
+
+
+def verified_thread(api, event):
+    require(bool(api.owner) and bool(api.team), "missing_owner_or_team")
+    require(event.get("teamId") == api.team and event.get("senderUserId") == api.owner
+            and not event.get("sourceAppId"), "owner_only")
+    for key in ("channelId",):
+        require(bool(re.fullmatch(r"[CDG][A-Z0-9]+", event.get(key, ""))), "invalid_event")
+    for key in ("messageTs", "threadTs"):
+        require(bool(re.fullmatch(r"\d+\.\d+", event.get(key, ""))), "invalid_event")
+    actor = api.slack("auth.test", {})
+    require(actor.get("user_id") == api.owner and actor.get("team_id") == api.team
+            and not actor.get("bot_id"), "slack_actor_mismatch")
+    messages, cursor, seen = [], "", set()
+    while True:
+        page = api.slack("conversations.replies", {"channel": event["channelId"],
+            "ts": event["threadTs"], "limit": 100, **({"cursor": cursor} if cursor else {})})
+        messages.extend(page.get("messages", []))
+        cursor = page.get("response_metadata", {}).get("next_cursor", "")
+        require(not page.get("has_more") or bool(cursor), "incomplete_slack_thread")
+        if not cursor:
+            break
+        require(cursor not in seen, "invalid_slack_cursor")
+        seen.add(cursor)
+    found = [m for m in messages if m.get("ts") == event["messageTs"]]
+    require(len(found) == 1, "trigger_message_missing")
+    message = found[0]
+    require(message.get("user") == api.owner and not message.get("app_id") and not message.get("bot_id")
+            and message.get("subtype") not in ("bot_message", "message_changed", "message_deleted"), "owner_only")
+    require(message.get("text") == event.get("text"), "trigger_changed")
+    require(bool(re.search(r"<@" + re.escape(api.owner) + r"(?:\|[^>]+)?>", message.get("text", ""))), "direct_owner_mention_required")
+    return messages
+
+
+def reaction(api, event, name, remove=False):
+    api.slack("reactions.remove" if remove else "reactions.add", {
+        "channel": event["channelId"], "timestamp": event["messageTs"], "name": name})
+
+
+class Journal:
+    """Durable write intents plus a process lock, shared by all runs on this Runtime."""
+    def __init__(self, directory):
+        self.path = Path(directory)
+        self.path.mkdir(parents=True, exist_ok=True, mode=0o700)
+        self.db = sqlite3.connect(self.path / "actions.sqlite", timeout=30)
+        self.db.execute("CREATE TABLE IF NOT EXISTS actions (key TEXT PRIMARY KEY, digest TEXT, phase TEXT, receipt TEXT)")
+        self.db.commit()
+
+    @contextlib.contextmanager
+    def lock(self, key, busy_code="ticket_lock_busy"):
+        with (self.path / (fingerprint(key) + ".lock")).open("a") as handle:
+            try:
+                fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError:
+                raise Blocked(busy_code) from None
+            try:
+                yield
+            finally:
+                fcntl.flock(handle, fcntl.LOCK_UN)
+
+    def get(self, key):
+        row = self.db.execute("SELECT digest, phase, receipt FROM actions WHERE key=?", (key,)).fetchone()
+        return {"digest": row[0], "phase": row[1], "receipt": json.loads(row[2])} if row else None
+
+    def put(self, key, digest, phase, receipt=None):
+        self.db.execute("INSERT OR REPLACE INTO actions VALUES(?,?,?,?)", (key, digest, phase, json.dumps(receipt or {})))
+        self.db.commit()
+
+    def close(self):
+        self.db.close()
+
+
+def comments(api, issue):
+    start = 0
+    while True:
+        page = api.jira(f"issue/{issue}/comment?startAt={start}&maxResults=100&expand=properties")
+        rows = page.get("comments", [])
+        yield from rows
+        start += len(rows)
+        if start >= page.get("total", start):
+            break
+        require(bool(rows), "incomplete_jira_comments")
+
+
+def empty(value):
+    return value is None or value == "" or value == [] or value == {} or (
+        isinstance(value, dict) and value.get("type") == "doc" and not text_of(value).strip())
+
+
+def transition_plan(api, issue, plan):
+    fields = issue["fields"]
+    current = fields["status"]
+    if current.get("name", "").casefold() in ("closed", "resolved"):
+        return {"already_complete": True, "status": current}
+    available = api.jira(f"issue/{issue['id']}/transitions?expand=transitions.fields").get("transitions", [])
+    target = plan.get("targetStatus")
+    require(target is None or target.casefold() in ("closed", "resolved"), "invalid_target_status")
+    candidates = [t for t in available if t.get("to", {}).get("name", "").casefold()
+                  in ([target.casefold()] if target else ["closed", "resolved"])]
+    if plan.get("transitionId"):
+        candidates = [t for t in candidates if str(t["id"]) == str(plan["transitionId"])]
+    require(len(candidates) == 1, "terminal_transition_missing_or_ambiguous")
+    selected = candidates[0]
+    screen = selected.get("fields", {})
+    supplied = plan.get("fields", {})
+    require(isinstance(supplied, dict), "invalid_fields")
+    require(set(supplied) <= set(screen), "field_not_on_transition_screen")
+    patch = {}
+    for field, value in supplied.items():
+        # Preserve existing content; only fill missing fields.
+        require(empty(fields.get(field)) or matches(fields.get(field), value), "existing_field_would_change")
+        if not matches(fields.get(field), value):
+            english(value)
+            patch[field] = value
+    for field, meta in screen.items():
+        if meta.get("required"):
+            value = patch.get(field, fields.get(field))
+            require(not empty(value), "missing_required_field:" + field)
+            patch[field] = value
+        value = patch.get(field)
+        options = meta.get("allowedValues", [])
+        if value is not None and options:
+            for entry in value if isinstance(value, list) else [value]:
+                require(any(entry == option or isinstance(entry, dict) and any(
+                    k in entry for k in ("id", "value", "name")) and all(
+                        str(entry[k]) == str(option.get(k)) for k in ("id", "value", "name") if k in entry)
+                    for option in options), "invalid_field_option:" + field)
+    return {"transition": {"id": selected["id"]}, "fields": patch, "target": selected["to"]}
+
+
+def validate_request(plan, event):
+    require(bool(re.fullmatch(r"[A-Z][A-Z0-9_]*-\d+", plan.get("issue", ""))), "invalid_issue_key")
+    actions = plan.get("actions")
+    require(isinstance(actions, list) and bool(actions) and len(actions) == len(set(actions))
+            and set(actions) <= {"reply", "close"}, "invalid_actions")
+    require(plan.get("requestConfirmed") is True, "explicit_request_required")
+    require(plan.get("requestText") == event["text"], "request_text_mismatch")
+    return [action for action in ("reply", "close") if action in actions]
+
+
+def verify_codex_evidence(item, issue):
+    client = None
+    try:
+        client = Codex()
+        turns = list(pages(client, "thread/turns/list", {"threadId": item["threadId"],
+            "limit": 50, "itemsView": "full", "sortDirection": "asc"}))
+        require(any(re.search(r"(?<![A-Z0-9_])" + re.escape(issue) + r"(?![A-Z0-9_])", item_text(record), re.I)
+                    for turn in turns for record in turn.get("items", [])
+                    if record.get("type") in ("userMessage", "agentMessage")), "codex_ticket_mismatch")
+        require(any(turn["id"] == item.get("turnId") and record.get("id") == item.get("itemId")
+                    and item["quote"] in item_text(record) for turn in turns for record in turn.get("items", [])),
+                "codex_evidence_mismatch")
+    except (Unavailable, OSError):
+        raise Blocked("codex_evidence_unavailable") from None
+    finally:
+        if client:
+            client.close()
+
+
+def validate_reply(plan, messages):
+    roots = plan.get("rootCause", {})
+    require(roots.get("confirmed") is True and bool(roots.get("summary", "").strip()), "root_cause_not_confirmed")
+    evidence = roots.get("evidence", [])
+    require(bool(evidence), "root_cause_evidence_required")
+    for item in evidence:
+        require(item.get("source") in ("slack", "codex") and bool(item.get("quote", "").strip()), "invalid_evidence")
+        if item["source"] == "slack":
+            require(any(m.get("ts") == item.get("messageTs") and item["quote"] in m.get("text", "")
+                        for m in messages), "slack_evidence_mismatch")
+        else:
+            require(all(item.get(k) for k in ("threadId", "turnId", "itemId")), "codex_evidence_reference_required")
+            verify_codex_evidence(item, plan["issue"])
+    body = plan.get("comment", "")
+    require(isinstance(body, str) and body.startswith("#intercom\n") and bool(body[len("#intercom\n"):].strip()), "intercom_comment_required")
+    english(body)
+
+
+def post_recorded(api, journal, key, digest, path, body, intent=None):
+    journal.put(key, digest, "writing", intent)
+    try:
+        return api.jira(path, "POST", body)
+    except Blocked as exc:
+        if re.fullmatch(r"http_4\d\d", str(exc)) and str(exc) not in ("http_408", "http_429"):
+            journal.put(key, digest, "rejected")
+        raise
+
+
+def execute_plan(api, event, plan, journal, execute=False):
+    messages = verified_thread(api, event)
+    actions = validate_request(plan, event)
+    require(any(re.search(r"(?<![A-Z0-9_])" + re.escape(plan["issue"]) + r"(?![A-Z0-9_])", m.get("text", ""), re.I)
+                for m in messages), "ticket_not_in_slack_thread")
+    actor = api.jira("myself")["accountId"]
+    require(bool(api.jira_account) and actor == api.jira_account, "jira_actor_mismatch")
+    issue = api.jira("issue/" + plan["issue"])
+    require(issue.get("key") == plan["issue"] and str(issue.get("id", "")).isdigit(), "jira_issue_mismatch")
+    operation = fingerprint([api.base, event["teamId"], event["channelId"], event["messageTs"], issue["id"]])
+    result = {"issue": issue["key"], "dry_run": not execute, "completed": [], "receipts": {}, "errors": {}}
+    with journal.lock([api.base, issue["id"]]):
+        for action in actions:
+            try:
+                messages = verified_thread(api, event)
+                content = plan.get("comment") if action == "reply" else {k: plan.get(k) for k in ("targetStatus", "transitionId", "fields")}
+                key, digest = operation + ":" + action, fingerprint(content)
+                previous = journal.get(key)
+                require(not previous or previous["phase"] == "rejected" or previous["digest"] == digest, "operation_content_changed")
+                if previous and previous["phase"] == "done":
+                    result["completed"].append(action)
+                    result["receipts"][action] = previous["receipt"]
+                    continue
+                if action == "reply":
+                    validate_reply(plan, messages)
+                    if not execute:
+                        result["receipts"][action] = {"ready": True, "comment": plan["comment"]}
+                        continue
+                    existing = [c for c in comments(api, issue["id"]) if c.get("author", {}).get("accountId") == actor
+                                and text_of(c.get("body")) == plan["comment"]]
+                    if existing:
+                        receipt = {"commentId": existing[-1]["id"], "verified": True, "recovered": True}
+                    else:
+                        require(not previous or previous["phase"] != "writing", "ambiguous_comment_write")
+                        created = post_recorded(api, journal, key, digest, f"issue/{issue['id']}/comment",
+                            {"body": adf(plan["comment"]), "properties": [{"key": "slack-ticket-action", "value": operation}]})
+                        saved = api.jira(f"issue/{issue['id']}/comment/{created['id']}")
+                        require(saved.get("author", {}).get("accountId") == actor and text_of(saved.get("body")) == plan["comment"],
+                                "comment_verification_failed")
+                        receipt = {"commentId": saved["id"], "verified": True}
+                else:
+                    fresh = api.jira("issue/" + issue["id"])
+                    close = transition_plan(api, fresh, plan)
+                    if not execute:
+                        result["receipts"][action] = close
+                        continue
+                    if close.get("already_complete"):
+                        if previous and previous["phase"] == "writing":
+                            intent = previous["receipt"]
+                            require(fresh["fields"]["status"]["id"] == intent.get("target", {}).get("id")
+                                    and all(matches(fresh["fields"].get(f), v) for f, v in intent.get("fields", {}).items()),
+                                    "transition_reconciliation_failed")
+                        receipt = {"status": close["status"]["name"], "verified": True, "already_complete": True}
+                    else:
+                        require(not previous or previous["phase"] != "writing", "ambiguous_transition_write")
+                        post_recorded(api, journal, key, digest, f"issue/{issue['id']}/transitions",
+                            {"transition": close["transition"], "fields": close["fields"]}, {"target": close["target"], "fields": close["fields"]})
+                        saved = api.jira("issue/" + issue["id"])
+                        require(saved["fields"]["status"]["id"] == close["target"]["id"], "transition_verification_failed")
+                        require(all(matches(saved["fields"].get(f), v) for f, v in close["fields"].items()), "field_verification_failed")
+                        receipt = {"status": saved["fields"]["status"]["name"], "verified": True}
+                journal.put(key, digest, "done", receipt)
+                result["completed"].append(action)
+                result["receipts"][action] = receipt
+            except Blocked as exc:
+                result["errors"][action] = str(exc)
+                # Unknown write outcomes require reconciliation before another mutation.
+                if str(exc).startswith(("network_", "ambiguous_", "http_5")):
+                    break
+    if result["errors"]:
+        result["error"] = "ticket_actions_incomplete"
+    return result
+
+
+def explain(code):
+    messages = {
+        "root_cause_not_confirmed": "尚未定位到有证据支持的具体原因，未发送 #intercom 评论",
+        "root_cause_evidence_required": "缺少支持具体原因的调查证据，未发送评论",
+        "terminal_transition_missing_or_ambiguous": "Jira 当前没有唯一明确的 Closed/Resolved 流转，请指定目标状态或处理工作流限制",
+        "jira_content_must_be_english": "拟写入 Jira 的内容包含非英文文本，需要先改为英文",
+        "existing_field_would_change": "拟补充的字段与已有内容冲突，需要核实后再处理",
+        "ambiguous_comment_write": "上次评论写入结果不明，需要先核对 Jira，未重复提交",
+        "ambiguous_transition_write": "上次状态流转结果不明，需要先核对 Jira，未重复提交",
+        "network_or_response_unknown": "请求超时或响应异常，需要先核对 Jira 是否已执行，未盲目重试",
+        "http_400": "Jira 拒绝写入，可能存在额外的必填字段或工作流校验，需要检查 Jira 表单",
+        "http_401": "Jira 身份认证失败，需要更新授权配置",
+        "http_403": "当前 Jira 身份没有执行权限，需要检查项目权限或工作流限制",
+        "ticket_lock_busy": "另一个任务正在处理同一 ticket，请等待该任务结束后再重试",
+    }
+    if code.startswith("missing_required_field:"):
+        return "Jira 必填字段 " + code.split(":", 1)[1] + " 缺少可确认的值，请补充该字段信息"
+    return messages.get(code, "校验或执行受阻（" + code + "），需要核实对应信息后继续")
+
+
+def _run(api, event, plan, journal, execute=False):
+    if not execute:
+        return execute_plan(api, event, plan, journal, False)
+    verified_thread(api, event)
+    require(plan.get("requestConfirmed") is True and plan.get("requestText") == event.get("text"), "explicit_request_required")
+    # An admitted, semantically confirmed request gets ack before checking root cause/fields.
+    reaction(api, event, "ack")
+    try:
+        try:
+            result = execute_plan(api, event, plan, journal, True)
+        except Blocked as exc:
+            result = {"issue": plan.get("issue"), "error": str(exc), "completed": [], "errors": {"preflight": str(exc)}}
+        if "error" in result:
+            failure_key = fingerprint(["failure", event, plan.get("issue")])
+            if not journal.get(failure_key):
+                journal.put(failure_key, "", "writing")
+                completed = ", ".join(result.get("completed", [])) or "无"
+                reasons = "；".join(explain(code) for code in result.get("errors", {}).values())
+                api.slack("chat.postMessage", {"channel": event["channelId"], "thread_ts": event["threadTs"],
+                    "text": "这次工单操作未全部完成。已完成：" + completed + "；原因：" + reasons +
+                    "。已完成的步骤会保留，后续重试会先核对实际状态。",
+                    "unfurl_links": False, "unfurl_media": False})
+                journal.put(failure_key, "", "done")
+    finally:
+        reaction(api, event, "ack", remove=True)
+    if "error" not in result:
+        reaction(api, event, "white_check_mark")
+    return result
+
+
+def run(api, event, plan, journal, execute=False):
+    if not execute:
+        return _run(api, event, plan, journal, False)
+    key = ["event", api.base, event.get("teamId"), event.get("channelId"), event.get("messageTs")]
+    with journal.lock(key, "same_message_running"):
+        return _run(api, event, plan, journal, True)
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("command", choices=["inspect", "run"])
+    parser.add_argument("--event", required=True, help="Path to original relay eventPayload JSON")
+    parser.add_argument("--plan", help="Path to Agent-reviewed plan JSON")
+    parser.add_argument("--execute", action="store_true")
+    args = parser.parse_args()
+    api = Api()
+    event = json.loads(Path(args.event).read_text())
+    if "eventPayload" in event:
+        event = event["eventPayload"]
+    if args.command == "inspect":
+        print(json.dumps({"messages": verified_thread(api, event)}, ensure_ascii=False))
+        return
+    require(bool(args.plan), "plan_required")
+    directory = os.environ.get("TICKET_STATE_DIR")
+    require(bool(directory) and Path(directory).is_absolute(), "missing_persistent_state_directory")
+    journal = Journal(directory)
+    try:
+        result = run(api, event, json.loads(Path(args.plan).read_text()), journal, args.execute)
+        print(json.dumps(result, ensure_ascii=False))
+        if "error" in result:
+            sys.exit(4)
+    finally:
+        journal.close()
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except Blocked as exc:
+        print(json.dumps({"error": str(exc)}, ensure_ascii=False))
+        sys.exit(4)

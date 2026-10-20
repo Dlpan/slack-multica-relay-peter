@@ -64,3 +64,19 @@ pnpm lint
 `GET /api/health` 仅证明函数可响应。消费有45秒整体预算，部署函数上限60秒；入站发布请求超时2秒。平台冷启动、网络延迟与配额仍须实测。
 
 语义验收场景见 [PR Review 上下文用例](REVIEW-CONTEXT-CASES.md)。单元测试验证传输、配置和身份边界，不将关键词匹配结果冒充 Agent 的语义判断结果。
+
+## Owner 本人工单处理
+
+新增 `SLACK_TASK_FILTER=pr_review_and_ticket`，并设置 `RELAY_OWNER_SLACK_USER_ID`（必须也在 `SLACK_TARGET_USER_IDS`）。每条消息分别生成执行策略：owner 本人发送、直接 @owner、无 app 来源的消息可进入工单语义判断；其他发送者/应用/仅用户组 mention 仍只有 PR Review 能力。排队或同一卡片的历史授权不赋予新消息额外权限；语义由 Agent 判断，Relay 不使用关键词猜动作。
+
+同步本仓库 `AGENT-PROMPT.md` 到 Peter Agent，并绑定 `multica-skills/slack-ticket-actions`。此 Prompt 基于 Peter 当前线上版本，保留身份、附件降级、Approve 和开发数据规则。不要替换其他成员的 Agent。
+
+- 回复：读取原 Slack thread 及本地 Codex 对应项目聊天；有证据支持具体原因后，新增英文 `#intercom` 评论。
+- 关闭：owner 主动要求 close 就确认已解决，无需检查客户环境、部署或 PR 合并。动态读取 Closed/Resolved 流转及必填字段，所有新补充内容用英文，不猜字段、选项或缺失事实。
+- 不限 Jira 项目前缀。只回复不顺便关闭，只关闭不自动回复；组合请求分别记录成功/失败。
+- 工单确认接单在触发消息加 `ack`；全部动作成功后移除 `ack` 并加 `white_check_mark`。受阻/部分完成不加完成表情，移除 `ack` 后在原 thread 中文说明。PR Review 原有 reaction 行为独立保留。
+- Helper 重新读取真实 Slack 作者及原文，验证 owner User actor、workspace 和已确认的 Jira accountId；Jira 写入有持久 intent、同 ticket 进程锁、重复执行对账及写后验证。自然语言意图、原因充分性和客户表述仍由 Agent 判断；这些校验不是对 Agent 任意 shell 工具的全局权限沙箱。
+
+Agent 单独配置 `SLACK_TEAM_ID`、`TICKET_JIRA_ACCOUNT_ID` 和绝对持久路径 `TICKET_STATE_DIR`。Jira 凭据使用已授权的 Agent Secret，或 `TICKET_JIRA_ENV_FILE` 指向本机 owner Jira Skill 的 `.env`（仅加载 Jira 凭据，禁止从任务工作目录隐式加载）。不要复制本机凭据到云端。`TICKET_CODEX_HOME` 指向 owner 的 Codex 存储，避免使用 Multica 隔离的 CODEX_HOME；可用 `TICKET_CODEX_BIN` 指定可执行文件。跨机器的其他工具不参与本机锁，不能声称全局 exactly-once。
+
+发布顺序：先验证本机 Slack/Jira owner 身份及 Codex 只读访问，再导入并绑定 Skill、合入最新线上 Prompt 和 Agent 环境；最后部署 Relay 新模式。回滚先恢复 Relay `pr_review`，再撤回工单 Prompt/绑定。旧队列不重放，真实 Jira 写入需在用户主动的具体 ticket 指令下验收。
