@@ -197,6 +197,157 @@ class TicketActionsTest(unittest.TestCase):
                     with another.lock([self.api.base,'123']):pass
         finally:another.close()
 
+class BugApi(FakeApi):
+    def __init__(self, status='In Progress'):
+        super().__init__()
+        self.issue['fields']['issuetype']={'name':'Bug Online'}
+        self.issue['fields']['status']={'id':{'Open':'open','In Progress':'dev','In Testing':'testing'}[status],'name':status}
+        self.issue['names']={'root':'Root Cause','solution':'Solution','devResult':'Dev Result'}
+        self.issue['fields'].update(root=None,solution=None,devResult=None)
+        self.stages={
+            'Open':[{'id':'start-id','name':'Start Dev','to':{'id':'dev','name':'In Progress'},'fields':{}}],
+            'In Progress':[{'id':'fix-id','name':'Bug Fixed','to':{'id':'testing','name':'In Testing'},'fields':{
+                'root':{'name':'Root Cause','required':False,'schema':{'custom':'jira:textarea'}},
+                'solution':{'name':'Solution','required':False,'schema':{'custom':'jira:textarea'}},
+                'devResult':{'name':'Dev Result','required':False,'schema':{'type':'option-with-child'},'allowedValues':[{'id':'done-option','value':'Done'}]}}}],
+            'In Testing':[{'id':'pass-id','name':'Pass Test','to':{'id':'resolved','name':'Resolved'},'fields':{}}]}
+        self.fail_stage=None
+        self.unknown_stage=None
+        self.unknown_applied=True
+    def jira(self,path,method='GET',body=None):
+        if '/transitions?' in path:
+            return {'transitions':copy.deepcopy(self.stages.get(self.issue['fields']['status']['name'],[]))}
+        if method=='POST' and path.endswith('/transitions'):
+            transition=next(t for t in self.stages.get(self.issue['fields']['status']['name'],[]) if t['id']==body['transition']['id'])
+            if self.fail_stage==transition['id']:raise t.Blocked('http_400')
+            if self.unknown_stage==transition['id'] and not self.unknown_applied:
+                self.writes.append((path,body));raise t.Blocked('network_or_response_unknown')
+            self.writes.append((path,body))
+            self.issue['fields'].update(copy.deepcopy(body['fields']))
+            self.issue['fields']['status']=copy.deepcopy(transition['to'])
+            if self.unknown_stage==transition['id']:raise t.Blocked('network_or_response_unknown')
+            return {}
+        return super().jira(path,method,body)
+
+class BugWorkflowTest(unittest.TestCase):
+    def setUp(self):
+        self.temp=tempfile.TemporaryDirectory();self.journal=t.Journal(self.temp.name)
+        self.api=BugApi()
+        self.plan={'issue':'ENG-123','actions':['close'],'requestConfirmed':True,'requestText':EVENT['text'],
+                   'targetStatus':'Resolved','fields':{},'bugFix':{
+                       'devResult':'Done','rootCause':'The timeline used stale staff data.',
+                       'solution':'Read current card staff when rendering the timeline.'}}
+    def tearDown(self):self.journal.close();self.temp.cleanup()
+    def execute(self):return t.run(self.api,EVENT,self.plan,self.journal,True)
+    def transitions(self):return [b['transition']['id'] for p,b in self.api.writes if p.endswith('/transitions')]
+    def test_in_progress_resolves_in_two_steps_with_required_fields(self):
+        result=self.execute()
+        self.assertEqual(result['completed'],['close'])
+        self.assertEqual(self.transitions(),['fix-id','pass-id'])
+        self.assertEqual(self.api.issue['fields']['status']['name'],'Resolved')
+        first=self.api.writes[0][1]['fields']
+        self.assertEqual(first['devResult'],{'id':'done-option'})
+        self.assertEqual(t.text_of(first['root']),self.plan['bugFix']['rootCause'])
+        self.execute();self.assertEqual(self.transitions(),['fix-id','pass-id'])
+    def test_open_uses_only_named_start_dev_before_bug_fixed(self):
+        self.api=BugApi('Open')
+        self.assertEqual(self.execute()['completed'],['close'])
+        self.assertEqual(self.transitions(),['start-id','fix-id','pass-id'])
+    def test_in_testing_only_resolves_and_does_not_repeat_bug_fixed(self):
+        self.api=BugApi('In Testing');self.plan.pop('bugFix')
+        self.assertEqual(self.execute()['completed'],['close'])
+        self.assertEqual(self.transitions(),['pass-id'])
+    def test_dry_run_reports_conditional_route_without_mutating(self):
+        result=t.run(self.api,EVENT,self.plan,self.journal,False)
+        self.assertTrue(result['receipts']['close']['conditional'])
+        self.assertEqual(result['receipts']['close']['pendingFinalState'],'Resolved')
+        self.assertFalse(self.api.writes or self.api.slack_writes)
+    def test_all_three_business_fields_required_even_with_false_metadata(self):
+        for missing in ['devResult','rootCause','solution']:
+            with self.subTest(field=missing):
+                self.plan['bugFix'].pop(missing)
+                result=self.execute()
+                self.assertIn('missing_required_field:',result['errors']['close'])
+                self.assertFalse(self.api.writes)
+                self.setUp_plan_values()
+    def setUp_plan_values(self):
+        self.plan['bugFix']={'devResult':'Done','rootCause':'The timeline used stale staff data.',
+                            'solution':'Read current card staff when rendering the timeline.'}
+    def test_open_missing_facts_does_not_even_start_dev(self):
+        self.api=BugApi('Open');self.plan['bugFix'].pop('rootCause')
+        self.assertIn('missing_required_field:',self.execute()['errors']['close'])
+        self.assertFalse(self.api.writes)
+    def test_invalid_enum_and_chinese_prose_block_before_transition(self):
+        self.plan['bugFix']['devResult']='Invented'
+        self.assertIn('invalid_field_option:',self.execute()['errors']['close'])
+        self.assertFalse(self.api.writes)
+        self.setUp_plan_values();self.plan['bugFix']['solution']='修复'
+        self.assertEqual(self.execute()['errors']['close'],'jira_content_must_be_english')
+        self.assertFalse(self.api.writes)
+    def test_missing_final_transition_reports_in_testing_partial_progress(self):
+        self.api.stages['In Testing']=[]
+        result=self.execute()
+        self.assertEqual(result['completed'],[])
+        self.assertEqual(result['receipts']['close']['steps'][-1]['status'],'In Testing')
+        self.assertEqual(self.transitions(),['fix-id'])
+        self.assertFalse(any(m=='reactions.add' and b['name']=='white_check_mark' for m,b in self.api.slack_writes))
+        notice=next(b['text'] for m,b in self.api.slack_writes if m=='chat.postMessage')
+        self.assertIn('In Testing',notice)
+    def test_final_rejection_retry_continues_without_repeating_first_step(self):
+        self.api.fail_stage='pass-id';self.assertIn('error',self.execute())
+        self.api.fail_stage=None
+        self.assertEqual(self.execute()['completed'],['close'])
+        self.assertEqual(self.transitions(),['fix-id','pass-id'])
+    def test_new_final_required_field_can_be_supplied_after_intermediate(self):
+        self.api.stages['In Testing'][0]['fields']={'note':{'name':'Resolution Note','required':True}}
+        result=self.execute()
+        self.assertEqual(result['errors']['close'],'missing_required_field:Resolution Note')
+        self.assertEqual(self.transitions(),['fix-id'])
+        self.plan['fields']={'note':'Resolution requested by the owner.'}
+        self.assertEqual(self.execute()['completed'],['close'])
+        self.assertEqual(self.transitions(),['fix-id','pass-id'])
+    def test_unknown_applied_intermediate_recovers_then_resolves(self):
+        self.api.unknown_stage='fix-id';self.assertIn('error',self.execute())
+        self.api.unknown_stage=None
+        self.assertEqual(self.execute()['completed'],['close'])
+        self.assertEqual(self.transitions(),['fix-id','pass-id'])
+    def test_unknown_unapplied_step_is_not_blindly_retried(self):
+        self.api.unknown_stage='fix-id';self.api.unknown_applied=False
+        self.assertIn('error',self.execute());self.api.unknown_stage=None
+        self.assertEqual(self.execute()['errors']['close'],'ambiguous_transition_write')
+        self.assertEqual(self.transitions(),['fix-id'])
+    def test_unknown_applied_final_step_recovers_without_repeating(self):
+        self.api.unknown_stage='pass-id';self.assertIn('error',self.execute());self.api.unknown_stage=None
+        self.assertEqual(self.execute()['completed'],['close'])
+        self.assertEqual(self.transitions(),['fix-id','pass-id'])
+    def test_non_bug_and_unrelated_intermediate_are_not_traversed(self):
+        self.api.issue['fields']['issuetype']={'name':'Task'}
+        self.assertIn('error',self.execute());self.assertFalse(self.api.writes)
+        self.api.issue['fields']['issuetype']={'name':'Bug Online'}
+        self.api.stages['In Progress'][0]['name']='Need Clarification'
+        self.assertIn('error',self.execute());self.assertFalse(self.api.writes)
+    def test_edit_during_workflow_stops_after_verified_intermediate(self):
+        original=self.api.jira
+        def jira(path,*args):
+            result=original(path,*args)
+            if len(args)>0 and args[0]=='POST' and self.api.issue['fields']['status']['name']=='In Testing':
+                self.api.messages[-1]['text']='Changed original instruction'
+            return result
+        self.api.jira=jira
+        result=self.execute()
+        self.assertEqual(result['errors']['close'],'trigger_changed')
+        self.assertEqual(self.transitions(),['fix-id'])
+        self.assertEqual(result['receipts']['close']['steps'][-1]['status'],'In Testing')
+    def test_open_conflicting_existing_facts_do_not_start_dev(self):
+        self.api=BugApi('Open');self.api.issue['fields']['root']=t.adf('Existing different cause.')
+        self.assertEqual(self.execute()['errors']['close'],'existing_field_would_change')
+        self.assertFalse(self.api.writes)
+    def test_existing_values_preserved(self):
+        self.api.issue['fields'].update(root=t.adf('Existing cause.'),solution=t.adf('Existing solution.'),devResult={'id':'done-option','value':'Done'})
+        self.plan['bugFix']={}
+        self.assertEqual(self.execute()['completed'],['close'])
+        self.assertEqual(t.text_of(self.api.issue['fields']['root']),'Existing cause.')
+
 class ApiTransportTest(unittest.TestCase):
     def test_slack_reads_use_query_parameters(self):
         api=t.Api({'SLACK_USER_TOKEN':'test-token'})

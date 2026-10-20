@@ -221,35 +221,57 @@ def empty(value):
         isinstance(value, dict) and value.get("type") == "doc" and not text_of(value).strip())
 
 
-def transition_plan(api, issue, plan):
+BUG_FIELDS = {"devResult": "Dev Result", "rootCause": "Root Cause", "solution": "Solution"}
+
+
+def is_bug(issue):
+    return bool(re.search(r"\bbug\b", issue["fields"].get("issuetype", {}).get("name", ""), re.I))
+
+
+def bug_values(plan):
+    values = plan.get("bugFix", {})
+    require(isinstance(values, dict) and set(values) <= set(BUG_FIELDS), "invalid_bug_fix_fields")
+    return values
+
+
+def bug_start_preflight(api, issue, plan):
+    # Open may expose only Start Dev. Require the known business facts before
+    # taking that first step; bind field IDs/options when Bug Fixed becomes live.
+    detail = api.jira(f"issue/{issue['id']}?expand=names")
+    values = bug_values(plan)
+    for semantic, name in BUG_FIELDS.items():
+        ids = [field for field, label in detail.get("names", {}).items() if label.casefold() == name.casefold()]
+        current = detail["fields"].get(ids[0]) if len(ids) == 1 else None
+        value = values.get(semantic, current)
+        require(not empty(value), "missing_required_field:" + name)
+        if semantic in values and not empty(current):
+            same = (isinstance(value, str) and (current.get("value") if isinstance(current, dict) and semantic == "devResult"
+                    else text_of(current)) == value) or matches(current, value)
+            require(same, "existing_field_would_change")
+        if semantic in values and not matches(current, value):
+            english(value)
+
+
+def transition_fields(issue, selected, supplied, required_names=()):
     fields = issue["fields"]
-    current = fields["status"]
-    if current.get("name", "").casefold() in ("closed", "resolved"):
-        return {"already_complete": True, "status": current}
-    available = api.jira(f"issue/{issue['id']}/transitions?expand=transitions.fields").get("transitions", [])
-    target = plan.get("targetStatus")
-    require(target is None or target.casefold() in ("closed", "resolved"), "invalid_target_status")
-    candidates = [t for t in available if t.get("to", {}).get("name", "").casefold()
-                  in ([target.casefold()] if target else ["closed", "resolved"])]
-    if plan.get("transitionId"):
-        candidates = [t for t in candidates if str(t["id"]) == str(plan["transitionId"])]
-    require(len(candidates) == 1, "terminal_transition_missing_or_ambiguous")
-    selected = candidates[0]
     screen = selected.get("fields", {})
-    supplied = plan.get("fields", {})
     require(isinstance(supplied, dict), "invalid_fields")
     require(set(supplied) <= set(screen), "field_not_on_transition_screen")
+    required_ids = set()
+    for name in required_names:
+        ids = [field for field, meta in screen.items() if meta.get("name", "").casefold() == name.casefold()]
+        require(len(ids) == 1, "bug_field_metadata_missing:" + name)
+        required_ids.add(ids[0])
     patch = {}
     for field, value in supplied.items():
-        # Preserve existing content; only fill missing fields.
         require(empty(fields.get(field)) or matches(fields.get(field), value), "existing_field_would_change")
         if not matches(fields.get(field), value):
             english(value)
             patch[field] = value
     for field, meta in screen.items():
-        if meta.get("required"):
+        if meta.get("required") or field in required_ids:
             value = patch.get(field, fields.get(field))
-            require(not empty(value), "missing_required_field:" + field)
+            require(not empty(value), "missing_required_field:" + meta.get("name", field))
             patch[field] = value
         value = patch.get(field)
         options = meta.get("allowedValues", [])
@@ -259,7 +281,61 @@ def transition_plan(api, issue, plan):
                     k in entry for k in ("id", "value", "name")) and all(
                         str(entry[k]) == str(option.get(k)) for k in ("id", "value", "name") if k in entry)
                     for option in options), "invalid_field_option:" + field)
-    return {"transition": {"id": selected["id"]}, "fields": patch, "target": selected["to"]}
+    return patch
+
+
+def bug_fixed_fields(issue, selected, plan):
+    screen = selected.get("fields", {})
+    supplied = {}
+    for semantic, value in bug_values(plan).items():
+        name = BUG_FIELDS[semantic]
+        ids = [field for field, meta in screen.items() if meta.get("name", "").casefold() == name.casefold()]
+        require(len(ids) == 1, "bug_field_metadata_missing:" + name)
+        field, meta = ids[0], screen[ids[0]]
+        if semantic == "devResult" and isinstance(value, str):
+            options = [o for o in meta.get("allowedValues", []) if o.get("value", "").casefold() == value.casefold()]
+            require(len(options) == 1, "invalid_field_option:" + field)
+            value = {"id": options[0]["id"]}
+        elif isinstance(value, str) and meta.get("schema", {}).get("custom", "").endswith(":textarea"):
+            value = adf(value)
+        supplied[field] = value
+    return transition_fields(issue, selected, supplied, BUG_FIELDS.values())
+
+
+def transition_plan(api, issue, plan):
+    current = issue["fields"]["status"]
+    status = current.get("name", "").casefold()
+    if status in ("closed", "resolved"):
+        return {"already_complete": True, "status": current}
+    available = [t for t in api.jira(f"issue/{issue['id']}/transitions?expand=transitions.fields").get("transitions", [])
+                 if t.get("isAvailable") is not False]
+    target = plan.get("targetStatus")
+    require(target is None or target.casefold() in ("closed", "resolved"), "invalid_target_status")
+    if is_bug(issue) and status == "in testing":
+        target = "Resolved"
+    candidates = [t for t in available if t.get("to", {}).get("name", "").casefold()
+                  in ([target.casefold()] if target else ["closed", "resolved"])]
+    if plan.get("transitionId"):
+        candidates = [t for t in candidates if str(t["id"]) == str(plan["transitionId"])]
+    intermediate = False
+    if not candidates and is_bug(issue) and status in ("open", "in progress"):
+        require(target is None or target.casefold() == "resolved", "bug_workflow_target_must_be_resolved")
+        candidates = [t for t in available if t.get("name", "").casefold() == "bug fixed"
+                      and t.get("to", {}).get("name", "").casefold() == "in testing"]
+        if not candidates and status == "open":
+            candidates = [t for t in available if t.get("name", "").casefold() == "start dev"
+                          and t.get("to", {}).get("name", "").casefold() == "in progress"]
+            if len(candidates) == 1:
+                bug_start_preflight(api, issue, plan)
+        intermediate = True
+    require(len(candidates) == 1, "terminal_transition_missing_or_ambiguous")
+    selected = candidates[0]
+    if intermediate and selected.get("name", "").casefold() == "bug fixed":
+        patch = bug_fixed_fields(issue, selected, plan)
+    else:
+        patch = transition_fields(issue, selected, {} if intermediate else plan.get("fields", {}))
+    return {"transition": {"id": selected["id"]}, "fields": patch, "target": selected["to"],
+            "intermediate": intermediate, **({"pendingFinalState": "Resolved", "conditional": True} if intermediate else {})}
 
 
 def validate_request(plan, event):
@@ -319,6 +395,62 @@ def post_recorded(api, journal, key, digest, path, body, intent=None):
         raise
 
 
+def close_ticket(api, event, plan, journal, key, digest, execute):
+    prior = journal.get(key)
+    progress = prior["receipt"] if prior and prior["phase"] == "workflow" else {"steps": []}
+    for _ in range(4):
+        verified_thread(api, event)
+        fresh = api.jira("issue/" + plan["issue"])
+        if execute and progress.get("active"):
+            step_key = progress["active"]
+            step = journal.get(step_key)
+            require(bool(step), "invalid_workflow_state")
+            intent = step["receipt"]
+            if step["phase"] != "rejected":
+                require(fresh["fields"]["status"]["id"] == intent["target"]["id"], "ambiguous_transition_write")
+                require(all(matches(fresh["fields"].get(f), v) for f, v in intent.get("fields", {}).items()),
+                        "transition_reconciliation_failed")
+                checkpoint = {"transitionId": intent["transitionId"], "status": intent["target"]["name"], "verified": True}
+                journal.put(step_key, step["digest"], "done", intent)
+                progress["steps"].append(checkpoint)
+            progress.pop("active")
+            journal.put(key, digest, "workflow", progress)
+        close = transition_plan(api, fresh, plan)
+        if not execute:
+            return close
+        if close.get("already_complete"):
+            if prior and prior["phase"] == "writing":
+                intent = prior["receipt"]
+                require(fresh["fields"]["status"]["id"] == intent.get("target", {}).get("id")
+                        and all(matches(fresh["fields"].get(f), v) for f, v in intent.get("fields", {}).items()),
+                        "transition_reconciliation_failed")
+            return {"status": fresh["fields"]["status"]["name"], "verified": True,
+                    "already_complete": True, "steps": progress["steps"]}
+        require(not prior or prior["phase"] != "writing", "ambiguous_transition_write")
+        staged = close["intermediate"] or bool(progress["steps"])
+        intent = {"target": close["target"], "fields": close["fields"], "transitionId": close["transition"]["id"]}
+        step_key = key + ":step:" + fingerprint([fresh["fields"]["status"]["id"], close["transition"]["id"]]) if staged else key
+        if staged:
+            # The parent points at the pending step before its POST. A retry must
+            # reconcile that step before discovering or submitting the next one.
+            progress["active"] = step_key
+            journal.put(key, digest, "workflow", progress)
+        post_recorded(api, journal, step_key, digest, f"issue/{fresh['id']}/transitions",
+                      {"transition": close["transition"], "fields": close["fields"]}, intent)
+        saved = api.jira("issue/" + fresh["id"])
+        require(saved["fields"]["status"]["id"] == close["target"]["id"], "transition_verification_failed")
+        require(all(matches(saved["fields"].get(f), v) for f, v in close["fields"].items()), "field_verification_failed")
+        checkpoint = {"transitionId": close["transition"]["id"], "status": saved["fields"]["status"]["name"], "verified": True}
+        if staged:
+            journal.put(step_key, digest, "done", intent)
+            progress["steps"].append(checkpoint)
+            progress.pop("active")
+            journal.put(key, digest, "workflow", progress)
+        if not close["intermediate"]:
+            return {"status": saved["fields"]["status"]["name"], "verified": True, "steps": progress["steps"]}
+    raise Blocked("workflow_step_limit")
+
+
 def execute_plan(api, event, plan, journal, execute=False):
     messages = verified_thread(api, event)
     actions = validate_request(plan, event)
@@ -332,12 +464,18 @@ def execute_plan(api, event, plan, journal, execute=False):
     result = {"issue": issue["key"], "dry_run": not execute, "completed": [], "receipts": {}, "errors": {}}
     with journal.lock([api.base, issue["id"]]):
         for action in actions:
+            key = operation + ":" + action
             try:
                 messages = verified_thread(api, event)
                 content = plan.get("comment") if action == "reply" else {k: plan.get(k) for k in ("targetStatus", "transitionId", "fields")}
-                key, digest = operation + ":" + action, fingerprint(content)
+                if action == "close" and "bugFix" in plan:
+                    content["bugFix"] = plan["bugFix"]
+                digest = fingerprint(content)
                 previous = journal.get(key)
-                require(not previous or previous["phase"] == "rejected" or previous["digest"] == digest, "operation_content_changed")
+                changeable_workflow = previous and previous["phase"] == "workflow" and (not previous["receipt"].get("active")
+                    or (journal.get(previous["receipt"]["active"]) or {}).get("phase") == "rejected")
+                require(not previous or previous["phase"] == "rejected" or changeable_workflow or previous["digest"] == digest,
+                        "operation_content_changed")
                 if previous and previous["phase"] == "done":
                     result["completed"].append(action)
                     result["receipts"][action] = previous["receipt"]
@@ -360,31 +498,19 @@ def execute_plan(api, event, plan, journal, execute=False):
                                 "comment_verification_failed")
                         receipt = {"commentId": saved["id"], "verified": True}
                 else:
-                    fresh = api.jira("issue/" + issue["id"])
-                    close = transition_plan(api, fresh, plan)
+                    receipt = close_ticket(api, event, plan, journal, key, digest, execute)
                     if not execute:
-                        result["receipts"][action] = close
+                        result["receipts"][action] = receipt
                         continue
-                    if close.get("already_complete"):
-                        if previous and previous["phase"] == "writing":
-                            intent = previous["receipt"]
-                            require(fresh["fields"]["status"]["id"] == intent.get("target", {}).get("id")
-                                    and all(matches(fresh["fields"].get(f), v) for f, v in intent.get("fields", {}).items()),
-                                    "transition_reconciliation_failed")
-                        receipt = {"status": close["status"]["name"], "verified": True, "already_complete": True}
-                    else:
-                        require(not previous or previous["phase"] != "writing", "ambiguous_transition_write")
-                        post_recorded(api, journal, key, digest, f"issue/{issue['id']}/transitions",
-                            {"transition": close["transition"], "fields": close["fields"]}, {"target": close["target"], "fields": close["fields"]})
-                        saved = api.jira("issue/" + issue["id"])
-                        require(saved["fields"]["status"]["id"] == close["target"]["id"], "transition_verification_failed")
-                        require(all(matches(saved["fields"].get(f), v) for f, v in close["fields"].items()), "field_verification_failed")
-                        receipt = {"status": saved["fields"]["status"]["name"], "verified": True}
                 journal.put(key, digest, "done", receipt)
                 result["completed"].append(action)
                 result["receipts"][action] = receipt
             except Blocked as exc:
                 result["errors"][action] = str(exc)
+                if action == "close":
+                    state = journal.get(key)
+                    if state and state["phase"] == "workflow":
+                        result["receipts"][action] = {"complete": False, "steps": state["receipt"].get("steps", [])}
                 # Unknown write outcomes require reconciliation before another mutation.
                 if str(exc).startswith(("network_", "ambiguous_", "http_5")):
                     break
@@ -397,7 +523,7 @@ def explain(code):
     messages = {
         "root_cause_not_confirmed": "尚未定位到有证据支持的具体原因，未发送 #intercom 评论",
         "root_cause_evidence_required": "缺少支持具体原因的调查证据，未发送评论",
-        "terminal_transition_missing_or_ambiguous": "Jira 当前没有唯一明确的 Closed/Resolved 流转，请指定目标状态或处理工作流限制",
+        "terminal_transition_missing_or_ambiguous": "Jira 当前没有唯一明确的终态或已授权 Bug 工作流动作，需要核对具体流转；未要求管理员新增直接关闭",
         "jira_content_must_be_english": "拟写入 Jira 的内容包含非英文文本，需要先改为英文",
         "existing_field_would_change": "拟补充的字段与已有内容冲突，需要核实后再处理",
         "ambiguous_comment_write": "上次评论写入结果不明，需要先核对 Jira，未重复提交",
@@ -431,6 +557,9 @@ def _run(api, event, plan, journal, execute=False):
                 journal.put(failure_key, "", "writing")
                 completed = ", ".join(result.get("completed", [])) or "无"
                 reasons = "；".join(explain(code) for code in result.get("errors", {}).values())
+                steps = result.get("receipts", {}).get("close", {}).get("steps", [])
+                if steps:
+                    reasons = "工单最后确认状态为 " + steps[-1]["status"] + "，关闭尚未完成；" + reasons
                 api.slack("chat.postMessage", {"channel": event["channelId"], "thread_ts": event["threadTs"],
                     "text": "这次工单操作未全部完成。已完成：" + completed + "；原因：" + reasons +
                     "。已完成的步骤会保留，后续重试会先核对实际状态。",

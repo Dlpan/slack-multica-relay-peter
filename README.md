@@ -73,6 +73,7 @@ pnpm lint
 
 - 回复：读取原 Slack thread 及本地 Codex 对应项目聊天；有证据支持具体原因后，新增英文 `#intercom` 评论。
 - 关闭：owner 主动要求 close 就确认已解决，无需检查客户环境、部署或 PR 合并。动态读取 Closed/Resolved 流转及必填字段，所有新补充内容用英文，不猜字段、选项或缺失事实。
+- Bug 类（含 Bug Online）没有直接关闭流转时，按 `Bug Fixed → In Testing → Resolved` 推进；Open 仅有 Start Dev 时先进入 In Progress。Dev Result、Root Cause、Solution 按业务规则强制必填，即使 Jira 元数据标为非必填。字段 ID、枚举和每一步 transition ID 均实时查询，新增文本用英文；只在最终 Resolved 后标记完成。分步记录与回读支持从中间状态继续，未知写入先对账；不自动走其他工作流分支。
 - 不限 Jira 项目前缀。只回复不顺便关闭，只关闭不自动回复；组合请求分别记录成功/失败。
 - 工单确认接单在触发消息加 `ack`；全部动作成功后移除 `ack` 并加 `white_check_mark`。受阻/部分完成不加完成表情，移除 `ack` 后在原 thread 中文说明。PR Review 原有 reaction 行为独立保留。
 - Helper 重新读取真实 Slack 作者及原文，验证 owner User actor、workspace 和已确认的 Jira accountId；Jira 写入有持久 intent、同 ticket 进程锁、重复执行对账及写后验证。自然语言意图、原因充分性和客户表述仍由 Agent 判断；这些校验不是对 Agent 任意 shell 工具的全局权限沙箱。
