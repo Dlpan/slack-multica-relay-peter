@@ -125,6 +125,57 @@ class TicketActionsTest(unittest.TestCase):
         self.assertEqual(self.execute()['completed'],['close'])
         saved=self.api.writes[0][1]['fields']['solution']
         self.assertEqual(saved['type'],'doc');self.assertEqual(t.text_of(saved),self.plan['fields']['solution'])
+    def test_system_rich_text_normalizes_plain_text_to_adf(self):
+        self.plan['actions']=['close'];self.plan['fields']['description']='Verified root cause and solution.'
+        self.api.transition['fields']['description']={'schema':{'type':'string','system':'description'}}
+        self.assertEqual(self.execute()['completed'],['close'])
+        self.assertEqual(self.api.writes[0][1]['fields']['description']['type'],'doc')
+    def test_wrong_field_json_types_are_blocked_before_post(self):
+        examples=[('option',[{'id':'1'}]),('array',{'id':'1'}),('string',{'value':'text'})]
+        for kind,value in examples:
+            with self.subTest(kind=kind):
+                self.plan['actions']=['close'];self.plan['fields']['field']=value
+                self.api.transition['fields']['field']={'schema':{'type':kind}}
+                self.assertEqual(self.execute()['errors']['close'],'invalid_field_type:field')
+                self.assertFalse(self.api.writes)
+    def test_transition_field_without_set_operation_is_blocked(self):
+        self.plan['actions']=['close'];self.api.transition['fields']['resolution']['operations']=[]
+        self.assertEqual(self.execute()['errors']['close'],'field_not_writable:resolution')
+        self.assertFalse(self.api.writes)
+    def test_existing_readonly_required_field_does_not_get_resubmitted(self):
+        self.plan['actions']=['close'];self.plan['fields']={}
+        self.api.issue['fields']['resolution']={'id':'1'}
+        self.api.transition['fields']['resolution']['operations']=[]
+        self.assertEqual(self.execute()['completed'],['close'])
+        self.assertNotIn('resolution',self.api.writes[0][1]['fields'])
+    def test_array_string_options_remain_supported(self):
+        self.plan['actions']=['close'];self.plan['fields']['tags']=['one']
+        self.api.transition['fields']['tags']={'schema':{'type':'array'},'allowedValues':['one','two']}
+        self.assertEqual(self.execute()['completed'],['close'])
+    def test_malformed_rich_text_document_is_blocked_before_post(self):
+        self.plan['actions']=['close'];self.plan['fields']['solution']={'text':'not an ADF document'}
+        self.api.transition['fields']['solution']={'schema':{'type':'string','custom':'jira:textarea'}}
+        self.assertEqual(self.execute()['errors']['close'],'invalid_field_document:solution')
+        self.assertFalse(self.api.writes)
+    def test_cascading_option_must_belong_to_selected_parent(self):
+        meta={'schema':{'type':'option-with-child'},'allowedValues':[
+            {'id':'parent1','value':'First','children':[{'id':'child1','value':'One'}]},
+            {'id':'parent2','value':'Second','children':[{'id':'child2','value':'Two'}]}]}
+        self.api.transition['fields']['reason']=meta
+        self.plan['actions']=['close'];self.plan['fields']['reason']={'id':'parent1','child':{'id':'child2'}}
+        self.assertEqual(self.execute()['errors']['close'],'invalid_field_option:reason')
+        self.assertFalse(self.api.writes)
+        self.plan['fields']['reason']['child']={'id':'child1'}
+        self.assertEqual(self.execute()['completed'],['close'])
+    def test_parent_without_children_rejects_invented_child(self):
+        self.api.transition['fields']['reason']={'schema':{'type':'option-with-child'},'allowedValues':[{'id':'parent'}]}
+        self.plan['actions']=['close'];self.plan['fields']['reason']={'id':'parent','child':{'id':'invented'}}
+        self.assertEqual(self.execute()['errors']['close'],'invalid_field_option:reason')
+        self.assertFalse(self.api.writes)
+    def test_dry_run_does_not_claim_server_validators_passed(self):
+        result=t.run(self.api,EVENT,self.plan,self.journal)
+        self.assertEqual(result['receipts']['close']['serverValidation'],'not_executed')
+        self.assertFalse(self.api.writes)
     def test_same_text_existing_rich_text_is_preserved(self):
         self.plan['actions']=['close'];self.plan['fields']['solution']='Existing solution.'
         self.api.transition['fields']['solution']={'name':'Solution','schema':{'custom':'jira:textarea'}}
@@ -364,6 +415,21 @@ class BugWorkflowTest(unittest.TestCase):
         self.api=BugApi('In Testing');self.plan.pop('bugFix')
         self.assertEqual(self.execute()['completed'],['close'])
         self.assertEqual(self.transitions(),['pass-id'])
+    def test_bug_report_qa_uses_direct_resolve_without_dev_fields(self):
+        self.api.issue['fields']['issuetype']={'name':'Bug Report'}
+        self.api.issue['fields']['status']={'id':'qa','name':'QA Investigating'}
+        self.api.stages['QA Investigating']=[{'id':'resolve-id','name':'Resolve Issue',
+            'to':{'id':'resolved','name':'Resolved'},'fields':{
+                'resolution':{'schema':{'type':'resolution'},'required':True,'operations':['set'],
+                              'allowedValues':[{'id':'done','name':'Done'}]},
+                'reason':{'schema':{'type':'option-with-child'},'required':False,'operations':['set'],
+                          'allowedValues':[{'id':'ux','value':'Misleading Product Experience'}]},
+                'solution':{'schema':{'type':'string','custom':'jira:textarea'},'required':False,'operations':['set']}}}]
+        self.plan.pop('bugFix')
+        self.plan['fields']={'resolution':{'id':'done'},'reason':{'id':'ux'},'solution':'Use the Closed conversation filter.'}
+        self.assertEqual(self.execute()['completed'],['close'])
+        self.assertEqual(self.transitions(),['resolve-id'])
+        self.assertEqual(self.api.writes[0][1]['fields']['solution']['type'],'doc')
     def test_dry_run_reports_conditional_route_without_mutating(self):
         result=t.run(self.api,EVENT,self.plan,self.journal,False)
         self.assertTrue(result['receipts']['close']['conditional'])
@@ -461,6 +527,18 @@ class BugWorkflowTest(unittest.TestCase):
         self.assertEqual(t.text_of(self.api.issue['fields']['root']),'Existing cause.')
 
 class ApiTransportTest(unittest.TestCase):
+    def test_failure_notice_attributes_both_actions_and_no_field_message(self):
+        result={'issue':'ENG-123','completed':[],'errors':{'reply':'http_400','close':'http_400'},
+                'validation':{'reply':{'categories':['invalid_document'],'fields':{}},
+                              'close':{'categories':[],'fields':{'resolution':'required'}}}}
+        text=t.failure_text(result)
+        self.assertIn('回复 #intercom',text);self.assertIn('关闭工单',text)
+        self.assertIn('富文本格式不符合 ADF',text);self.assertIn('resolution（缺少必填值）',text)
+        self.assertNotIn('可能存在额外的必填字段',text)
+    def test_http400_without_details_does_not_invent_a_workflow_cause(self):
+        text=t.failure_text({'issue':'ENG-123','completed':[],'errors':{'reply':'http_400'}})
+        self.assertIn('尚不能确定具体原因',text)
+        self.assertNotIn('工作流',text)
     def test_http400_keeps_field_categories_without_server_text(self):
         api=t.Api({'JIRA_LOGIN':'user','JIRA_API_TOKEN':'test-token'})
         body={'errors':{'customfield_13710':'Must be a valid document. customer@example.com private-token',
