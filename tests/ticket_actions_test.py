@@ -35,6 +35,10 @@ class FakeApi:
         if method=='auth.test': return dict(ok=True,user_id='U1', team_id='T1')
         if method=='conversations.replies': return dict(ok=True, messages=copy.deepcopy(self.messages), response_metadata={})
         self.slack_writes.append((method,body))
+        if method=='chat.postMessage':self.messages.append(dict(ts='200.000001',user='U1',text=body['text']))
+        if method=='chat.update':
+            for message in self.messages:
+                if message['ts']==body['ts']:message['text']=body['text']
         return dict(ok=True,ts='200.000001')
     def jira(self,path,method='GET',body=None):
         if method=='POST':
@@ -113,8 +117,11 @@ class TicketActionsTest(unittest.TestCase):
         result=self.execute()
         self.assertEqual(result['completed'],['reply'])
         self.assertIn('missing_required_field:resolution',result['errors']['close'])
+        self.assertTrue(result['notification_pending'])
+        self.assertFalse(any(m=='chat.postMessage' for m,b in self.api.slack_writes))
+        t.finalize_failure(self.api,EVENT,self.plan,self.journal)
         failure=next(b['text'] for m,b in self.api.slack_writes if m=='chat.postMessage')
-        self.assertIn('reply',failure)
+        self.assertIn('已发送 #intercom 评论',failure)
         self.assertEqual(len(self.api.writes),1)
     def test_non_english_comment_is_blocked(self):
         self.plan['actions']=['reply'];self.plan['comment']='#intercom\n原因是重复配置'
@@ -167,6 +174,57 @@ class TicketActionsTest(unittest.TestCase):
         self.plan['actions']=['reply'];self.api.fail_post='http_400'
         self.assertIn('error',self.execute());self.api.fail_post=None
         self.assertEqual(self.execute()['completed'],['reply'])
+        self.assertFalse(any(m=='chat.postMessage' for m,b in self.api.slack_writes))
+    def test_final_failure_is_explicit_idempotent_and_does_not_write_jira(self):
+        self.plan['fields']={};self.execute()
+        count=len(self.api.writes)
+        for _ in range(2):
+            result=t.finalize_failure(self.api,EVENT,self.plan,self.journal)
+            self.assertFalse(result['notification_pending'])
+        self.assertEqual(len(self.api.writes),count)
+        self.assertEqual(sum(m=='chat.postMessage' for m,b in self.api.slack_writes),1)
+        self.assertTrue(any(m=='reactions.remove' and b['name']=='ack' for m,b in self.api.slack_writes))
+    def test_failure_finalization_requires_last_executed_plan(self):
+        with self.assertRaisesRegex(t.Blocked,'current_execution_result_required'):
+            t.finalize_failure(self.api,EVENT,self.plan,self.journal)
+        self.plan['fields']={};self.execute();self.plan['fields']={'resolution':{'id':'1'}}
+        with self.assertRaisesRegex(t.Blocked,'current_execution_result_required'):
+            t.finalize_failure(self.api,EVENT,self.plan,self.journal)
+        self.assertFalse(any(m=='chat.postMessage' for m,b in self.api.slack_writes))
+    def test_unknown_applied_close_cannot_emit_stale_failure(self):
+        self.plan['actions']=['close'];self.api.after_post_error=True;self.execute()
+        with self.assertRaisesRegex(t.Blocked,'outcome_needs_reconciliation'):
+            t.finalize_failure(self.api,EVENT,self.plan,self.journal)
+        self.assertFalse(any(m=='chat.postMessage' for m,b in self.api.slack_writes))
+    def test_unknown_applied_comment_cannot_emit_stale_failure(self):
+        self.plan['actions']=['reply'];self.api.after_post_error=True;self.execute()
+        with self.assertRaisesRegex(t.Blocked,'outcome_needs_reconciliation'):
+            t.finalize_failure(self.api,EVENT,self.plan,self.journal)
+        self.assertFalse(any(m=='chat.postMessage' for m,b in self.api.slack_writes))
+    def test_success_corrects_previous_final_failure_without_new_message(self):
+        self.plan['fields']={};self.execute()
+        t.finalize_failure(self.api,EVENT,self.plan,self.journal)
+        self.plan['fields']={'resolution':{'id':'1'}}
+        self.assertEqual(self.execute()['completed'],['reply','close'])
+        self.assertEqual(sum(m=='chat.postMessage' for m,b in self.api.slack_writes),1)
+        update=next(b for m,b in self.api.slack_writes if m=='chat.update')
+        self.assertEqual(update['ts'],'200.000001');self.assertIn('全部完成',update['text'])
+        self.assertEqual(len(self.api.writes),2)
+    def test_unknown_failure_notice_is_not_reposted_and_success_reconciles_it(self):
+        self.plan['fields']={};self.execute()
+        original=self.api.slack
+        def slack(method,body):
+            result=original(method,body)
+            if method=='chat.postMessage':raise t.Blocked('network_or_response_unknown')
+            return result
+        self.api.slack=slack
+        with self.assertRaises(t.Blocked):t.finalize_failure(self.api,EVENT,self.plan,self.journal)
+        with self.assertRaisesRegex(t.Blocked,'failure_notice_outcome_unknown'):
+            t.finalize_failure(self.api,EVENT,self.plan,self.journal)
+        self.api.slack=original;self.plan['fields']={'resolution':{'id':'1'}}
+        self.assertEqual(self.execute()['completed'],['reply','close'])
+        self.assertEqual(sum(m=='chat.postMessage' for m,b in self.api.slack_writes),1)
+        self.assertTrue(any(m=='chat.update' for m,b in self.api.slack_writes))
     def test_already_resolved_is_noop(self):
         self.plan['actions']=['close'];self.api.issue['fields']['status']=dict(id='2',name='Resolved')
         self.assertEqual(self.execute()['completed'],['close'])
@@ -291,13 +349,18 @@ class BugWorkflowTest(unittest.TestCase):
         self.assertEqual(result['receipts']['close']['steps'][-1]['status'],'In Testing')
         self.assertEqual(self.transitions(),['fix-id'])
         self.assertFalse(any(m=='reactions.add' and b['name']=='white_check_mark' for m,b in self.api.slack_writes))
+        t.finalize_failure(self.api,EVENT,self.plan,self.journal)
         notice=next(b['text'] for m,b in self.api.slack_writes if m=='chat.postMessage')
         self.assertIn('In Testing',notice)
+        self.assertNotIn('已完成：无',notice)
     def test_final_rejection_retry_continues_without_repeating_first_step(self):
         self.api.fail_stage='pass-id';self.assertIn('error',self.execute())
+        self.assertFalse(any(m=='chat.postMessage' or m=='reactions.remove' for m,b in self.api.slack_writes))
         self.api.fail_stage=None
         self.assertEqual(self.execute()['completed'],['close'])
         self.assertEqual(self.transitions(),['fix-id','pass-id'])
+        self.assertFalse(any(m=='chat.postMessage' for m,b in self.api.slack_writes))
+        self.assertTrue(any(m=='reactions.add' and b['name']=='white_check_mark' for m,b in self.api.slack_writes))
     def test_new_final_required_field_can_be_supplied_after_intermediate(self):
         self.api.stages['In Testing'][0]['fields']={'note':{'name':'Resolution Note','required':True}}
         result=self.execute()
