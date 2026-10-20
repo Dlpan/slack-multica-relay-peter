@@ -29,12 +29,12 @@
 本节只在当前消息的可信 `taskPolicy.mode=pr_review_and_ticket` 下生效，优先于上述 PR-only 限制。不能沿用同一卡片里其他消息的工单授权。
 
 - 仅 Peter 本人 `U03JFM4M82C` 从 Slack 客户端发送且当前消息直接 @Peter 的回复/关闭指令有效；其他人 @Peter、仅 @grm-fe、Bot/应用代发均不授权工单操作。PR Review 保持原来的发送者范围和接单规则。
-- 完整读取已绑定 `slack-ticket-actions` Skill，严格通过其脚本复核真实 Slack 作者、User actor、工作区、当前消息和目标 Jira ticket。理解本次语义，不把询问、否定、引用或仅同步当成执行指令。不限 CS-* 或其他项目；多目标歧义时在原 thread 中文询问，不猜测。
+- 完整读取已绑定 `slack-ticket-actions` Skill，严格通过其脚本复核真实 Slack 作者、User actor、工作区、当前消息和目标 Jira ticket。理解本次语义，不把询问、否定、引用或仅同步当成执行指令。不限 CS-* 或其他项目；工单迁移改号时使用 Slack 中的旧编号，或通过 sourceIssue 同时查询新旧编号并验证解析到相同 Jira issue ID，不因新编号未出现在 thread 就要求 owner 重发指令；关联单不等于迁移。多目标歧义时在原 thread 中文询问，不猜测。
 - 确认收到可处理的工单指令后立即在触发消息添加 ack，再调查原因/必填字段。读取原 Slack thread 及对应本地 Codex 项目/关联 worktree 的调查聊天，结合最新证据。找不到/无法读取本地聊天时记录限制；Slack 证据充分即可继续。存在未解释的矛盾时不编造原因。
 - 回复需要有具体原因，用英文新增以 #intercom 开头的 comment。关闭时，Peter 本次主动的关闭/close 指令就表示已解决，不再检查客户环境、部署或 PR 合并，也不额外要求定位根因。动态读取 Jira Closed/Resolved 流转与必填字段，从事实补充英文内容；保留已有字段，不猜选项或缺失信息。
 - 对 Bug 类（含 Bug Online）没有直接关闭动作时，允许按标准工作流依次执行 Bug Fixed → In Testing → Resolved；Open 仅有 Start Dev 时先进入 In Progress。Bug Fixed 前必须有 Dev Result、Root Cause、Solution，即使 Jira 元数据标成非必填也要检查，从上下文补充英文事实并使用实时字段/选项。已在 In Testing 时只继续转 Resolved。每一步重新读取当前状态和可用动作，记录并回读结果；中途受阻报告最后确认状态，重试不重复已完成步骤。不走 Need Clarification、Fail Test 等无关流转，也不因没有直接关闭按钮而要求管理员开放。按 Skill 的 bugFix 参数和动态工作流实现，不硬编码 transition ID。
 - 只执行明确要求的 reply/close 动作：仅关闭不自动发 #intercom，仅回复不自动关闭。两项都要求时分别检查、执行和记录结果；一项失败不抹去另一项已完成的事实。
-- 工单 Jira 写入统一走 Skill helper，先 dry-run，再在本次已有授权下 execute，无需重复确认。必须持久化写入记录、同 ticket 加锁、写后回读；未知结果先对账，不盲目再次 POST。不要绕过 helper 直接发送评论或流转状态。
+- 工单 Jira 写入统一走 Skill helper，先 dry-run，再在本次已有授权下 execute，无需重复确认。必须持久化写入记录、同 ticket 加锁、写后回读；未知结果先对账，不盲目再次 POST。不要绕过 helper 直接发送评论或流转状态。helper 按实时字段 schema 将所有流转 textarea（含最终 Solution/Test Result）转为 ADF；400 的脱敏 validation 仅包含字段 ID 和固定类别，按实际字段排查，不把评论错误归因于关单必填字段。
 - 所有 Jira 新写入的评论和字段内容使用英文。执行中的一次错误不代表任务最终失败：helper 返回 notification_pending=true 时保留 ack，先检查实时字段/工作流并用现有证据恢复；明确拒绝可补齐后重试，未知写入先对账，不盲目重发。恢复期间不发失败通知。全部请求动作验证成功后移除 ack、添加 white_check_mark，不要求额外成功文字；同一触发消息此前有可追踪的失败通知时，helper 会更正该通知。确认缺少事实、权限或安全执行路径而无法继续时，使用 Skill 的 finalize-failure 和最后一次实际执行的 plan 发布一次最终中文阻断并移除 ack，说明真实完成动作、已确认的中间流转、具体原因和所需信息。outcome_needs_reconciliation 要先重新对账，不能发送旧失败结论。调查或 dry-run 阶段受阻也要用 Slack Skill 清理并反馈，不能静默退出。不能把最终答复或 reaction 失败当作 Jira 未执行而重复写入。
 
 ## 接单 reaction
