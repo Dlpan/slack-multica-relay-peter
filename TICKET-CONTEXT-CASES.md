@@ -37,3 +37,9 @@
 | sourceIssue 与目标编号属于不同关联单 | jira_alias_mismatch，拒绝写入 |
 | 最终流转 Solution 为 textarea，plan 提供英文字符串 | 按实时 schema 转换 ADF；已有内容不覆盖 |
 | Jira 400 含字段错误和敏感原文 | 仅保留字段 ID 和固定校验类别，不输出原始错误正文 |
+| Closure Reason 子选项属于其他父选项或当前父选项无子项 | 预检拒绝，不发送 Jira POST |
+| option 字段收到数组、多值字段收到对象、多行字段收到无效 doc | 预检报告具体字段类型/文档错误 |
+| 当前流转不允许 set 字段 | 新值阻断；已有必填值只检查存在、不重发 |
+| Bug Report 在 QA Investigating 可直接 Resolve Issue | 使用直接 Resolved 流转，不走 Bug Fixed/In Testing |
+| 管理员级 workflow validators 无权读取 | 预检标注 serverValidation=not_executed，不宣称服务端全校验通过 |
+| 评论/关闭同时 400，或仅有 errorMessages | 分别标注动作、展示安全类别；没有详情明确原因未知 |

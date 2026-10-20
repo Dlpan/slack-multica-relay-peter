@@ -290,6 +290,35 @@ def bug_start_preflight(api, issue, plan):
             english(value)
 
 
+def validate_field(field, meta, value):
+    schema = meta.get("schema", {})
+    kind = schema.get("type")
+    rich = schema.get("custom", "").endswith(":textarea") or schema.get("system") in ("description", "environment")
+    if rich:
+        require(isinstance(value, dict) and value.get("type") == "doc" and value.get("version") == 1
+                and isinstance(value.get("content"), list), "invalid_field_document:" + field)
+    elif kind == "string":
+        require(isinstance(value, str), "invalid_field_type:" + field)
+    elif kind == "array":
+        require(isinstance(value, list), "invalid_field_type:" + field)
+    elif kind in ("option", "option-with-child", "resolution", "user", "version", "component"):
+        require(isinstance(value, dict), "invalid_field_type:" + field)
+    options = meta.get("allowedValues", [])
+    if not options:
+        return
+    for entry in value if isinstance(value, list) else [value]:
+        candidates = [option for option in options if entry == option or isinstance(entry, dict) and isinstance(option, dict) and any(
+            k in entry for k in ("id", "value", "name")) and all(
+            str(entry[k]) == str(option.get(k)) for k in ("id", "value", "name") if k in entry)]
+        require(len(candidates) == 1, "invalid_field_option:" + field)
+        if isinstance(entry, dict) and "child" in entry and not empty(entry["child"]):
+            require(kind == "option-with-child", "invalid_field_option:" + field)
+            child = entry["child"]
+            require(isinstance(child, dict) and any(k in child for k in ("id", "value", "name")) and any(
+                all(str(child[k]) == str(option.get(k)) for k in ("id", "value", "name") if k in child)
+                for option in candidates[0].get("children", [])), "invalid_field_option:" + field)
+
+
 def transition_fields(issue, selected, supplied, required_names=()):
     fields = issue["fields"]
     screen = selected.get("fields", {})
@@ -302,7 +331,9 @@ def transition_fields(issue, selected, supplied, required_names=()):
         required_ids.add(ids[0])
     patch = {}
     for field, value in supplied.items():
-        if isinstance(value, str) and screen[field].get("schema", {}).get("custom", "").endswith(":textarea"):
+        schema = screen[field].get("schema", {})
+        if isinstance(value, str) and (schema.get("custom", "").endswith(":textarea")
+                                       or schema.get("system") in ("description", "environment")):
             value = adf(value)
         if not empty(fields.get(field)) and isinstance(value, dict) and value.get("type") == "doc" \
                 and text_of(fields[field]) == text_of(value):
@@ -315,15 +346,12 @@ def transition_fields(issue, selected, supplied, required_names=()):
         if meta.get("required") or field in required_ids:
             value = patch.get(field, fields.get(field))
             require(not empty(value), "missing_required_field:" + meta.get("name", field))
-            patch[field] = value
+            if field in patch or "operations" not in meta or "set" in (meta.get("operations") or []):
+                patch[field] = value
         value = patch.get(field)
-        options = meta.get("allowedValues", [])
-        if value is not None and options:
-            for entry in value if isinstance(value, list) else [value]:
-                require(any(entry == option or isinstance(entry, dict) and any(
-                    k in entry for k in ("id", "value", "name")) and all(
-                        str(entry[k]) == str(option.get(k)) for k in ("id", "value", "name") if k in entry)
-                    for option in options), "invalid_field_option:" + field)
+        if value is not None:
+            require("operations" not in meta or "set" in (meta.get("operations") or []), "field_not_writable:" + field)
+            validate_field(field, meta, value)
     return patch
 
 
@@ -378,6 +406,7 @@ def transition_plan(api, issue, plan):
     else:
         patch = transition_fields(issue, selected, {} if intermediate else plan.get("fields", {}))
     return {"transition": {"id": selected["id"]}, "fields": patch, "target": selected["to"],
+            "serverValidation": "not_executed",
             "intermediate": intermediate, **({"pendingFinalState": "Resolved", "conditional": True} if intermediate else {})}
 
 
@@ -587,7 +616,7 @@ def explain(code):
         "ambiguous_comment_write": "上次评论写入结果不明，需要先核对 Jira，未重复提交",
         "ambiguous_transition_write": "上次状态流转结果不明，需要先核对 Jira，未重复提交",
         "network_or_response_unknown": "请求超时或响应异常，需要先核对 Jira 是否已执行，未盲目重试",
-        "http_400": "Jira 拒绝写入，可能存在额外的必填字段或工作流校验，需要检查 Jira 表单",
+        "http_400": "Jira 返回 HTTP 400，请求格式或校验未通过",
         "http_401": "Jira 身份认证失败，需要更新授权配置",
         "http_403": "当前 Jira 身份没有执行权限，需要检查项目权限或工作流限制",
         "ticket_lock_busy": "另一个任务正在处理同一 ticket，请等待该任务结束后再重试",
@@ -595,6 +624,14 @@ def explain(code):
     }
     if code.startswith("missing_required_field:"):
         return "Jira 必填字段 " + code.split(":", 1)[1] + " 缺少可确认的值，请补充该字段信息"
+    if code.startswith("invalid_field_document:"):
+        return "Jira 字段 " + code.split(":", 1)[1] + " 必须使用 ADF 富文本格式"
+    if code.startswith("invalid_field_type:"):
+        return "Jira 字段 " + code.split(":", 1)[1] + " 的 JSON 类型不符合实时 schema"
+    if code.startswith("invalid_field_option:"):
+        return "Jira 字段 " + code.split(":", 1)[1] + " 的选项或父子关系不在实时可用值中"
+    if code.startswith("field_not_writable:"):
+        return "Jira 当前流转不允许设置字段 " + code.split(":", 1)[1]
     return messages.get(code, "校验或执行受阻（" + code + "），需要核实对应信息后继续")
 
 
@@ -612,11 +649,23 @@ def failure_text(result):
     steps = result.get("receipts", {}).get("close", {}).get("steps", [])
     if steps and "close" not in result.get("completed", []):
         completed.append("已流转至 " + steps[-1]["status"] + "（关闭尚未完成）")
-    reasons = "；".join(explain(code) for code in result.get("errors", {}).values())
-    for action, detail in result.get("validation", {}).items():
-        fields = ", ".join(field + ": " + code for field, code in detail.get("fields", {}).items())
+    labels = {"reply": "回复 #intercom", "close": "关闭工单", "preflight": "执行前校验"}
+    categories = {"invalid_document": "富文本格式不符合 ADF", "required": "缺少必填值",
+                  "not_editable": "字段当前不可写", "invalid_option": "选项无效", "rejected": "校验未通过"}
+    failures = []
+    for action, code in result.get("errors", {}).items():
+        reason = labels.get(action, action) + "：" + explain(code)
+        detail = result.get("validation", {}).get(action, {})
+        fields = "，".join(field + "（" + categories.get(category, "校验未通过") + "）"
+                          for field, category in detail.get("fields", {}).items())
         if fields:
-            reasons += "；" + action + " 字段校验：" + fields
+            reason += "；字段：" + fields
+        elif detail.get("categories"):
+            reason += "；" + "、".join(categories.get(category, "校验未通过") for category in detail["categories"])
+        elif code == "http_400":
+            reason += "；Jira 未返回可识别的字段详情，尚不能确定具体原因"
+        failures.append(reason)
+    reasons = "；".join(failures)
     current = result.get("receipts", {}).get("close", {}).get("currentStatus")
     if current:
         reasons = "工单当前状态为 " + current + "；" + reasons
