@@ -23,3 +23,9 @@
 | POST 超时但已写入 | 回读恢复；未知时停止，不重复 POST |
 | 调查过程中用户编辑原指令或撤销 | 原文变化阻断；Agent 读取新回复发现撤销则停止 |
 | 既有 PR Review 首次/复审/用户组/允许的应用 | 沿用原权限和 reaction，不受工单本人限制影响 |
+| Bug Online 在 In Progress，只有 Bug Fixed | 补齐三个英文必填字段，进入 In Testing 后重新查可用动作，再到 Resolved；最后加完成表情 |
+| Open 只有 Start Dev | 原因/解决信息齐全后先进入 In Progress，再按 Bug Fixed → In Testing → Resolved；信息不足不先改状态 |
+| Bug Fixed 三字段的 required=false | 仍检查 Dev Result、Root Cause 和 Solution，不把 API 非必填当作可以省略 |
+| 已在 In Testing | 只执行当前可用的 Resolved 动作，不退回 Open 或重复 Bug Fixed |
+| 已到 In Testing，但后续动作/字段/权限不满足 | 中文说明最后确认状态，不标记完成；重试从中间状态继续 |
+| 中间或最终 POST 超时 | 回读确认到达目标且字段一致才继续；未知结果不重发、不倒退状态 |
