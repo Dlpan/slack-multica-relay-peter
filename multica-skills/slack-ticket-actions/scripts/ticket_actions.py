@@ -539,6 +539,93 @@ def explain(code):
     return messages.get(code, "校验或执行受阻（" + code + "），需要核实对应信息后继续")
 
 
+def outcome_key(api, event, plan):
+    return fingerprint(["outcome", api.base, event, plan.get("issue")])
+
+
+def failure_key(event, plan):
+    return fingerprint(["failure", event, plan.get("issue")])
+
+
+def failure_text(result):
+    completed = [{"reply": "已发送 #intercom 评论", "close": "已完成关闭"}[action]
+                 for action in result.get("completed", [])]
+    steps = result.get("receipts", {}).get("close", {}).get("steps", [])
+    if steps and "close" not in result.get("completed", []):
+        completed.append("已流转至 " + steps[-1]["status"] + "（关闭尚未完成）")
+    reasons = "；".join(explain(code) for code in result.get("errors", {}).values())
+    current = result.get("receipts", {}).get("close", {}).get("currentStatus")
+    if current:
+        reasons = "工单当前状态为 " + current + "；" + reasons
+    return ("这次工单操作未全部完成（" + result["issue"] + "）。已完成：" + ("；".join(completed) or "无") + "；原因：" + reasons +
+            "。已完成的步骤会保留，后续重试会先核对实际状态。")
+
+
+def correct_failure_notice(api, event, plan, journal):
+    key = failure_key(event, plan)
+    previous = journal.get(key)
+    if not previous or previous["phase"] == "corrected":
+        return
+    receipt = previous["receipt"]
+    # A timed-out post is reconciled against its exact persisted text and owner.
+    # Legacy notices have no persisted text/ts and cannot be safely edited here.
+    if not receipt.get("messageTs") and receipt.get("text"):
+        found = [m for m in verified_thread(api, event) if m.get("user") == api.owner
+                 and m.get("text") == receipt["text"] and m.get("ts", "") >= event["messageTs"]]
+        require(len(found) <= 1, "ambiguous_failure_notice")
+        if found:
+            receipt["messageTs"] = found[0]["ts"]
+        require(bool(found), "failure_notice_outcome_unknown")
+    if receipt.get("messageTs"):
+        api.slack("chat.update", {"channel": event["channelId"], "ts": receipt["messageTs"],
+            "text": "本次工单操作已在后续重试中全部完成（" + plan["issue"] + "）。此前失败提示对应中途状态，现已更正。"})
+    journal.put(key, "", "corrected", receipt)
+
+
+def finalize_failure(api, event, plan, journal):
+    """Publish the final blocker only; never submit Jira comments/transitions."""
+    with journal.lock(["event", api.base, event.get("teamId"), event.get("channelId"), event.get("messageTs")],
+                      "same_message_running"):
+        verified_thread(api, event)
+        validate_request(plan, event)
+        saved = journal.get(outcome_key(api, event, plan))
+        require(saved and saved["digest"] == fingerprint(plan), "current_execution_result_required")
+        result = saved["receipt"]
+        require("error" in result, "failure_finalization_requires_error")
+        require(api.jira("myself").get("accountId") == api.jira_account and bool(api.jira_account), "jira_actor_mismatch")
+        issue = api.jira("issue/" + plan["issue"])
+        require(issue.get("key") == plan["issue"] and str(issue.get("id", "")).isdigit(), "jira_issue_mismatch")
+        with journal.lock([api.base, issue["id"]]):
+            issue = api.jira("issue/" + plan["issue"])
+            if "close" in result.get("errors", {}):
+                require(issue["fields"]["status"]["name"].casefold() not in ("closed", "resolved"),
+                        "outcome_needs_reconciliation")
+                result.setdefault("receipts", {}).setdefault("close", {})["currentStatus"] = issue["fields"]["status"]["name"]
+            if "reply" in result.get("errors", {}):
+                require(not any(c.get("author", {}).get("accountId") == api.jira_account
+                                and text_of(c.get("body")) == plan.get("comment")
+                                for c in comments(api, issue["id"])), "outcome_needs_reconciliation")
+            key = failure_key(event, plan)
+            previous = journal.get(key)
+            if previous and previous["phase"] != "corrected":
+                require(previous["phase"] == "done", "failure_notice_outcome_unknown")
+                receipt = previous["receipt"]
+                message = failure_text(result)
+                if receipt.get("messageTs") and receipt.get("text") != message:
+                    api.slack("chat.update", {"channel": event["channelId"], "ts": receipt["messageTs"], "text": message})
+                    journal.put(key, "", "done", {**receipt, "text": message})
+            else:
+                message = failure_text(result)
+                journal.put(key, "", "writing", {"text": message})
+                posted = api.slack("chat.postMessage", {"channel": event["channelId"], "thread_ts": event["threadTs"],
+                    "text": message, "unfurl_links": False, "unfurl_media": False})
+                journal.put(key, "", "done", {"text": message, "messageTs": posted["ts"]})
+            reaction(api, event, "ack", remove=True)
+            result["notification_pending"] = False
+            journal.put(outcome_key(api, event, plan), fingerprint(plan), "done", result)
+            return result
+
+
 def _run(api, event, plan, journal, execute=False):
     if not execute:
         return execute_plan(api, event, plan, journal, False)
@@ -547,27 +634,14 @@ def _run(api, event, plan, journal, execute=False):
     # An admitted, semantically confirmed request gets ack before checking root cause/fields.
     reaction(api, event, "ack")
     try:
-        try:
-            result = execute_plan(api, event, plan, journal, True)
-        except Blocked as exc:
-            result = {"issue": plan.get("issue"), "error": str(exc), "completed": [], "errors": {"preflight": str(exc)}}
-        if "error" in result:
-            failure_key = fingerprint(["failure", event, plan.get("issue")])
-            if not journal.get(failure_key):
-                journal.put(failure_key, "", "writing")
-                completed = ", ".join(result.get("completed", [])) or "无"
-                reasons = "；".join(explain(code) for code in result.get("errors", {}).values())
-                steps = result.get("receipts", {}).get("close", {}).get("steps", [])
-                if steps:
-                    reasons = "工单最后确认状态为 " + steps[-1]["status"] + "，关闭尚未完成；" + reasons
-                api.slack("chat.postMessage", {"channel": event["channelId"], "thread_ts": event["threadTs"],
-                    "text": "这次工单操作未全部完成。已完成：" + completed + "；原因：" + reasons +
-                    "。已完成的步骤会保留，后续重试会先核对实际状态。",
-                    "unfurl_links": False, "unfurl_media": False})
-                journal.put(failure_key, "", "done")
-    finally:
-        reaction(api, event, "ack", remove=True)
+        result = execute_plan(api, event, plan, journal, True)
+    except Blocked as exc:
+        result = {"issue": plan.get("issue"), "error": str(exc), "completed": [], "errors": {"preflight": str(exc)}}
+    result["notification_pending"] = "error" in result
+    journal.put(outcome_key(api, event, plan), fingerprint(plan), "done", result)
     if "error" not in result:
+        correct_failure_notice(api, event, plan, journal)
+        reaction(api, event, "ack", remove=True)
         reaction(api, event, "white_check_mark")
     return result
 
@@ -582,7 +656,7 @@ def run(api, event, plan, journal, execute=False):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("command", choices=["inspect", "run"])
+    parser.add_argument("command", choices=["inspect", "run", "finalize-failure"])
     parser.add_argument("--event", required=True, help="Path to original relay eventPayload JSON")
     parser.add_argument("--plan", help="Path to Agent-reviewed plan JSON")
     parser.add_argument("--execute", action="store_true")
@@ -599,7 +673,12 @@ def main():
     require(bool(directory) and Path(directory).is_absolute(), "missing_persistent_state_directory")
     journal = Journal(directory)
     try:
-        result = run(api, event, json.loads(Path(args.plan).read_text()), journal, args.execute)
+        plan = json.loads(Path(args.plan).read_text())
+        if args.command == "finalize-failure":
+            require(args.execute, "execute_required")
+            result = finalize_failure(api, event, plan, journal)
+        else:
+            result = run(api, event, plan, journal, args.execute)
         print(json.dumps(result, ensure_ascii=False))
         if "error" in result:
             sys.exit(4)

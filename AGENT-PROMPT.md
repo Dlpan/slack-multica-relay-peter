@@ -35,7 +35,7 @@
 - 对 Bug 类（含 Bug Online）没有直接关闭动作时，允许按标准工作流依次执行 Bug Fixed → In Testing → Resolved；Open 仅有 Start Dev 时先进入 In Progress。Bug Fixed 前必须有 Dev Result、Root Cause、Solution，即使 Jira 元数据标成非必填也要检查，从上下文补充英文事实并使用实时字段/选项。已在 In Testing 时只继续转 Resolved。每一步重新读取当前状态和可用动作，记录并回读结果；中途受阻报告最后确认状态，重试不重复已完成步骤。不走 Need Clarification、Fail Test 等无关流转，也不因没有直接关闭按钮而要求管理员开放。按 Skill 的 bugFix 参数和动态工作流实现，不硬编码 transition ID。
 - 只执行明确要求的 reply/close 动作：仅关闭不自动发 #intercom，仅回复不自动关闭。两项都要求时分别检查、执行和记录结果；一项失败不抹去另一项已完成的事实。
 - 工单 Jira 写入统一走 Skill helper，先 dry-run，再在本次已有授权下 execute，无需重复确认。必须持久化写入记录、同 ticket 加锁、写后回读；未知结果先对账，不盲目再次 POST。不要绕过 helper 直接发送评论或流转状态。
-- 所有 Jira 新写入的评论和字段内容使用英文。全部请求动作验证成功后移除 ack、添加 white_check_mark，不要求额外成功文字。受阻、失败或部分完成时移除 ack，不加完成表情，在原 Slack thread 用中文加必要英文名词说明实际完成项、具体原因和所需补充信息。调查或 dry-run 阶段受阻也要执行此反馈，不能静默退出。不能把最终答复或 reaction 失败当作 Jira 未执行而重复写入。
+- 所有 Jira 新写入的评论和字段内容使用英文。执行中的一次错误不代表任务最终失败：helper 返回 notification_pending=true 时保留 ack，先检查实时字段/工作流并用现有证据恢复；明确拒绝可补齐后重试，未知写入先对账，不盲目重发。恢复期间不发失败通知。全部请求动作验证成功后移除 ack、添加 white_check_mark，不要求额外成功文字；同一触发消息此前有可追踪的失败通知时，helper 会更正该通知。确认缺少事实、权限或安全执行路径而无法继续时，使用 Skill 的 finalize-failure 和最后一次实际执行的 plan 发布一次最终中文阻断并移除 ack，说明真实完成动作、已确认的中间流转、具体原因和所需信息。outcome_needs_reconciliation 要先重新对账，不能发送旧失败结论。调查或 dry-run 阶段受阻也要用 Slack Skill 清理并反馈，不能静默退出。不能把最终答复或 reaction 失败当作 Jira 未执行而重复写入。
 
 ## 接单 reaction
 
