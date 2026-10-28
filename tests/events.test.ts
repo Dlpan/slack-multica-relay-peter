@@ -64,6 +64,9 @@ describe("durable admission", () => {
   });
   const appReview = { ...event, app_id: "A2", bot_id: "B2", text: "<!subteam^S1> 帮忙看看 PR：<https://github.com/org/repo/pull/123>" };
   const appEnv = { ...env, SLACK_TARGET_SUBTEAM_IDS: "S1", SLACK_TASK_FILTER: "pr_review", SLACK_ALLOWED_APP_ACTORS: "A2:U2" };
+  const botReview = { type: "message", subtype: "bot_message", app_id: "A9", bot_id: "B9", channel: "C1",
+    ts: "100.000009", text: "<!subteam^S1> 已修复，请复审 <https://github.com/org/repo/pull/123>" };
+  const botEnv = { ...appEnv, SLACK_ALLOWED_BOT_IDS: "B9" };
   it("queues an approved User app's group review and retains its app identity", async () => {
     const f = vi.fn<typeof fetch>().mockResolvedValue(Response.json({ messageId: "group-review" }));
     const response = await acceptSlack(request(appReview), appEnv, f);
@@ -82,6 +85,19 @@ describe("durable admission", () => {
     expect((await response.json()).action).toBe("ignored");
     expect(f).not.toHaveBeenCalled();
   });
+  it("queues an explicitly approved bot message and retains its bot identity", async () => {
+    const f = vi.fn<typeof fetch>().mockResolvedValue(Response.json({ messageId: "bot-review" }));
+    const response = await acceptSlack(request(botReview), botEnv, f);
+    expect(await response.json()).toEqual({ action: "accepted", queueMessageId: "bot-review" });
+    const queued = JSON.parse(String(f.mock.calls[0]![1]!.body));
+    expect(queued).toMatchObject({ senderUserId: "B9", sourceAppId: "A9", sourceBotId: "B9" });
+  });
+  it("rejects bot messages that are not explicitly approved", async () => {
+    const f = vi.fn<typeof fetch>();
+    const response = await acceptSlack(request(botReview), appEnv, f);
+    expect((await response.json()).action).toBe("ignored");
+    expect(f).not.toHaveBeenCalled();
+  });
   it("rejects app messages by default", async () => {
     const f = vi.fn<typeof fetch>();
     const response = await acceptSlack(request(appReview), { ...appEnv, SLACK_ALLOWED_APP_ACTORS: "" }, f);
@@ -94,12 +110,27 @@ describe("durable admission", () => {
     expect(response.status).toBe(500);
     expect(f).not.toHaveBeenCalled();
   });
+  it.each(["all", "U2", "B2:*", "B2:B3"])("fails closed for invalid bot ID configuration: %s", async value => {
+    const f = vi.fn<typeof fetch>();
+    const response = await acceptSlack(request(botReview), { ...botEnv, SLACK_ALLOWED_BOT_IDS: value }, f);
+    expect(response.status).toBe(500);
+    expect(f).not.toHaveBeenCalled();
+  });
   it("rechecks app actor permission when consuming a queued review", async () => {
     const f = vi.fn<typeof fetch>();
     const response = await consumeQueue(new Request(env.RELAY_CONSUMER_URL, { method: "POST", body: JSON.stringify({
       teamId: "T1", channelId: "C1", senderUserId: "U2", sourceAppId: "A2", messageTs: "1.000001", threadTs: "1.000001",
       text: appReview.text, mention: { type: "subteam", id: "S1" },
     }) }), { ...appEnv, SLACK_ALLOWED_APP_ACTORS: "A2:U3" }, f);
+    expect(await response.json()).toEqual({ action: "ignored", reason: "policy_changed" });
+    expect(f).not.toHaveBeenCalled();
+  });
+  it("rechecks bot permission when consuming a queued review", async () => {
+    const f = vi.fn<typeof fetch>();
+    const response = await consumeQueue(new Request(env.RELAY_CONSUMER_URL, { method: "POST", body: JSON.stringify({
+      teamId: "T1", channelId: "C1", senderUserId: "B9", sourceAppId: "A9", sourceBotId: "B9",
+      messageTs: "1.000009", threadTs: "1.000009", text: botReview.text, mention: { type: "subteam", id: "S1" },
+    }) }), { ...botEnv, SLACK_ALLOWED_BOT_IDS: "B8" }, f);
     expect(await response.json()).toEqual({ action: "ignored", reason: "policy_changed" });
     expect(f).not.toHaveBeenCalled();
   });

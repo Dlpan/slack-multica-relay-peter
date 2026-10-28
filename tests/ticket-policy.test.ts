@@ -15,6 +15,7 @@ describe("per-message owner ticket policy", () => {
     ["owner direct", {}, "pr_review_and_ticket"],
     ["other sender", { senderUserId: "U2" }, "pr_review"],
     ["owner app", { sourceAppId: "A1" }, "pr_review"],
+    ["owner bot", { sourceBotId: "B1" }, "pr_review"],
     ["group alone", { text: "<!subteam^S1> close ENG-123", mention: { type: "subteam", id: "S1" } }, "pr_review"],
     ["both group and owner", { text: "<!subteam^S1> <@U1> close ENG-123", mention: { type: "subteam", id: "S1" } }, "pr_review_and_ticket"],
   ])("%s", async (_name, change, mode) => {

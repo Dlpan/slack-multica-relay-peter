@@ -24,6 +24,7 @@ export interface SlackThreadEvent {
   threadTs: string;
   senderUserId: string;
   sourceAppId?: string;
+  sourceBotId?: string;
   text: string;
   mention: MentionMatch;
   files?: unknown;
@@ -68,6 +69,7 @@ export async function routeSlackThreadEvent(
     && !!config.ticketOwnerUserId
     && event.senderUserId === config.ticketOwnerUserId
     && !event.sourceAppId
+    && !event.sourceBotId
     && !!findTargetMention(event.text, new Set([config.ticketOwnerUserId]), new Set());
   const taskPolicy = config.taskFilter === "pr_review" || config.taskFilter === "pr_review_and_ticket" ? {
     source: "relay_config" as const,

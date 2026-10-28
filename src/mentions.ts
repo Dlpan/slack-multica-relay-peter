@@ -22,16 +22,26 @@ export function findTargetMention(
   return undefined;
 }
 
-export function isSupportedMessage(event: SlackMessageEvent, allowedAppActors: ReadonlySet<string> = new Set()): boolean {
+export function isSupportedMessage(
+  event: SlackMessageEvent,
+  allowedAppActors: ReadonlySet<string> = new Set(),
+  allowedBotIds: ReadonlySet<string> = new Set(),
+): boolean {
   const subtype = typeof event.subtype === 'string' ? event.subtype : undefined;
+  const appActorAllowed = typeof event.app_id === 'string'
+    && typeof event.user === 'string'
+    && allowedAppActors.has(`${event.app_id}:${event.user}`);
+  const botAllowed = typeof event.bot_id === 'string'
+    && allowedBotIds.has(event.bot_id);
+  const applicationMarked = !!event.bot_id || !!event.app_id || subtype === 'bot_message';
   return event.type === 'message'
     && typeof event.channel === 'string'
     && typeof event.ts === 'string'
     && typeof event.text === 'string'
-    && ((!event.bot_id && !event.app_id)
-      || (typeof event.app_id === 'string' && typeof event.user === 'string'
-        && allowedAppActors.has(`${event.app_id}:${event.user}`)))
-    && !['bot_message', 'message_changed', 'message_deleted'].includes(subtype ?? '');
+    && !['message_changed', 'message_deleted'].includes(subtype ?? '')
+    && (subtype === 'bot_message'
+      ? botAllowed
+      : (!applicationMarked || appActorAllowed || botAllowed));
 }
 
 export interface SlackMessageEvent {
