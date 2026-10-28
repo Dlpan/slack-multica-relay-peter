@@ -4,6 +4,7 @@ export interface RelayConfig {
   taskFilter: TaskFilter;
   ticketOwnerUserId?: string;
   allowedAppActors: Set<string>;
+  allowedBotIds: Set<string>;
   signingSecret: string;
   teamId: string;
   targetUserIds: Set<string>;
@@ -49,6 +50,7 @@ export function loadRelayConfig(
     taskFilter: filter,
     ticketOwnerUserId,
     allowedAppActors: appActors(env.SLACK_ALLOWED_APP_ACTORS),
+    allowedBotIds: botIds(env.SLACK_ALLOWED_BOT_IDS),
     signingSecret: required(env, "SLACK_SIGNING_SECRET"),
     teamId: required(env, "SLACK_TEAM_ID"),
     allowedChannelIds: allowedChannels.ids,
@@ -87,6 +89,12 @@ function appActors(value: string | undefined): Set<string> {
   const entries = (value ?? "").split(",").map(x => x.trim()).filter(Boolean);
   if (entries.some(x => !/^A[A-Z0-9]+:[UW][A-Z0-9]+$/u.test(x)))
     throw new Error("invalid_app_actor");
+  return new Set(entries);
+}
+function botIds(value: string | undefined): Set<string> {
+  const entries = (value ?? "").split(",").map(x => x.trim()).filter(Boolean);
+  if (entries.some(x => !/^B[A-Z0-9]+$/u.test(x)))
+    throw new Error("invalid_bot_id");
   return new Set(entries);
 }
 function ids(value: string | undefined): Set<string> {

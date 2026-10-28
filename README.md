@@ -33,9 +33,9 @@ Agent 必须以 User 身份完整读取同一 thread 的根消息、触发之前
 
 用户组 mention 需要在 `SLACK_TARGET_SUBTEAM_IDS` 配置准确的组 ID；属于该组不会自动使个人 mention 规则命中。组与个人目标同时配置时任意一个命中即可，频道/发送者规则继续适用，PR 意图由 Agent 判断。
 
-Slack 应用通过 User 身份发送的消息也可能带 `bot_id` 和 `app_id`。默认忽略应用消息；如确需接收已核实的来源，在 `SLACK_ALLOWED_APP_ACTORS` 中配置准确的 `app_id:user_id` 配对，多个配对用逗号分隔。必须先核实发送人为真人账号，只开放所需应用与发送人，不支持通配符，也不要加入 Relay 自己的回复身份。`bot_message`、编辑和删除事件仍被忽略。
+Slack 应用通过 User 身份发送的消息也可能带 `bot_id` 和 `app_id`。默认忽略应用消息；如确需接收已核实的 User 代发来源，在 `SLACK_ALLOWED_APP_ACTORS` 中配置准确的 `app_id:user_id` 配对，多个配对用逗号分隔。需要允许真正的 Bot 消息时，在 `SLACK_ALLOWED_BOT_IDS` 中配置准确的 `bot_id`。两种配置都不支持通配符；只开放已核实的来源，不要加入 Relay 自己的回复身份。编辑和删除事件始终忽略。
 
-应用来源的 `sourceAppId` 会保留到队列，在消费时重新核对配对，撤销配置后旧队列消息也不能继续执行。启用用户组时还应同步 Agent prompt 的目标范围，不能继续要求每条消息都直接 mention 个人。环境变量变更后需要重新部署。
+应用来源的 `sourceAppId` 与 `sourceBotId` 会保留到队列，在消费时重新核对，撤销配置后旧队列消息也不能继续执行。Bot 来源不能获得 owner 本人工单权限，只能进入既有 PR Review 语义判断。启用用户组时还应同步 Agent prompt 的目标范围，不能继续要求每条消息都直接 mention 个人。环境变量变更后需要重新部署。
 
 ## 本地验证
 

@@ -71,6 +71,7 @@ function compactEvent(event: SlackThreadEvent): SlackThreadEvent {
     text: event.text,
     mention: { type: event.mention.type, id: event.mention.id },
     ...(event.sourceAppId ? { sourceAppId: event.sourceAppId } : {}),
+    ...(event.sourceBotId ? { sourceBotId: event.sourceBotId } : {}),
   };
   if (files === undefined) return rest;
   return {

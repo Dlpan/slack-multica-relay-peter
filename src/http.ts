@@ -41,13 +41,17 @@ function record(value: unknown): value is Record<string, unknown> {
   return !!value && typeof value === "object" && !Array.isArray(value);
 }
 function admitted(event: SlackThreadEvent, config: RelayConfig): boolean {
+  const sourceAllowed = (!event.sourceAppId && !event.sourceBotId)
+    || (!!event.sourceBotId && config.allowedBotIds.has(event.sourceBotId))
+    || (!!event.sourceAppId
+      && config.allowedAppActors.has(`${event.sourceAppId}:${event.senderUserId}`));
   return (
     event.teamId === config.teamId &&
     (config.allowAllChannels || config.allowedChannelIds.has(event.channelId)) &&
     !config.blockedChannelIds.has(event.channelId) &&
     (config.allowAllSenders || config.allowedSenderIds.has(event.senderUserId)) &&
     !config.blockedSenderIds.has(event.senderUserId) &&
-    (!event.sourceAppId || config.allowedAppActors.has(`${event.sourceAppId}:${event.senderUserId}`)) &&
+    sourceAllowed &&
     !!findTargetMention(
       event.text,
       config.targetUserIds,
@@ -69,6 +73,7 @@ function parsedEvent(value: unknown): SlackThreadEvent {
     ) ||
     typeof value.text !== "string" ||
     (value.sourceAppId !== undefined && (typeof value.sourceAppId !== "string" || !/^A[A-Z0-9]+$/u.test(value.sourceAppId))) ||
+    (value.sourceBotId !== undefined && (typeof value.sourceBotId !== "string" || !/^B[A-Z0-9]+$/u.test(value.sourceBotId))) ||
     !record(value.mention) ||
     !["user", "subteam"].includes(String(value.mention.type)) ||
     typeof value.mention.id !== "string"
@@ -150,7 +155,11 @@ export async function acceptSlack(
   if (
     body.type !== "event_callback" ||
     !record(body.event) ||
-    !isSupportedMessage(body.event as SlackMessageEvent, config.allowedAppActors)
+    !isSupportedMessage(
+      body.event as SlackMessageEvent,
+      config.allowedAppActors,
+      config.allowedBotIds,
+    )
   )
     return json({ action: "ignored" });
   const event = body.event;
@@ -167,8 +176,9 @@ export async function acceptSlack(
       channelId: event.channel,
       messageTs: event.ts,
       threadTs: event.thread_ts ?? event.ts,
-      senderUserId: event.user,
+      senderUserId: typeof event.user === "string" ? event.user : event.bot_id,
       ...(event.app_id ? { sourceAppId: event.app_id } : {}),
+      ...(event.bot_id ? { sourceBotId: event.bot_id } : {}),
       text: event.text,
       mention,
       ...(event.files ? { files: event.files } : {}),
