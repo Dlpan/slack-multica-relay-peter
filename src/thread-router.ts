@@ -177,17 +177,6 @@ export async function routeSlackThreadEvent(
       );
       return { action: "created", issueId: state.issueId };
     }
-    // A trusted release root represents exactly one GitHub run. The Agent
-    // re-reads the complete Slack thread, so later mentions are context only
-    // and must not create another execution for the same run.
-    if (config.releaseTaskPolicy) {
-      await config.store.set(
-        msgKey,
-        JSON.stringify({ phase: "done" }),
-        STATE_TTL_SECONDS,
-      );
-      return { action: "duplicate", issueId: state.issueId };
-    }
     const messageMarker = `<!-- relay-message:${digest(messageKey(event))} -->`;
     const existingComment = await findComment(
       config,

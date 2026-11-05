@@ -196,7 +196,7 @@ describe("direct Issue routing", () => {
     expect(f.agentGets).toBe(2);
     expect(f.commentPosts).toBe(1);
   });
-  it("coalesces later mentions in one release thread without waking the Agent again", async () => {
+  it("appends each new release mention and deduplicates only the same Slack message", async () => {
     const f = fixture();
     f.config.releaseTaskPolicy = {
       source: "relay_config",
@@ -220,13 +220,17 @@ describe("direct Issue routing", () => {
       runId: "12345",
     };
     expect((await routeSlackThreadEvent(root, f.config, f.fetcher)).action).toBe("created");
-    const duplicateMention = { ...root, messageTs: "102.000001", text: "<@U1> approve again" };
-    expect((await routeSlackThreadEvent(duplicateMention, f.config, f.fetcher)).action).toBe("duplicate");
-    expect((await routeSlackThreadEvent(duplicateMention, f.config, f.fetcher)).action).toBe("duplicate");
+    const followupMention = { ...root, messageTs: "102.000001", text: "<@U1> approve again" };
+    expect((await routeSlackThreadEvent(followupMention, f.config, f.fetcher)).action).toBe("comment_persisted");
+    expect((await routeSlackThreadEvent(followupMention, f.config, f.fetcher)).action).toBe("duplicate");
     expect(f.issuePosts).toBe(1);
-    expect(f.commentPosts).toBe(0);
-    expect(f.agentGets).toBe(1);
+    expect(f.commentPosts).toBe(1);
+    expect(f.agentGets).toBe(2);
     expect(f.issues[0]!.title).toContain("MoeGolibrary/moego-mobile · run 12345");
+    expect(payload(f.comments[0]!.content).eventPayload).toMatchObject({
+      messageTs: followupMention.messageTs,
+      text: followupMention.text,
+    });
   });
   it("recovers a committed Issue after lost response without second POST", async () => {
     const f = fixture();
