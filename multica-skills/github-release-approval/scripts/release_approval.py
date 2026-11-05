@@ -128,8 +128,7 @@ def verify_slack(event: dict[str, Any]) -> tuple[str, int]:
     require(message.get("user") == event["senderUserId"], "trigger_sender_changed")
     require(str(message.get("text") or "") == event["text"], "trigger_text_changed")
     require(not message.get("bot_id") and not message.get("app_id") and message.get("subtype") not in {"bot_message", "message_changed"}, "non_human_requester")
-    if event["senderUserId"] != OWNER:
-        require(f"<@{OWNER}>" in event["text"], "missing_owner_mention")
+    require(f"<@{OWNER}>" in event["text"], "missing_owner_mention")
     repo, run_id = next(iter(matches))
     require(repo in REPOSITORIES, "repository_not_allowed")
     return repo, run_id
@@ -157,7 +156,7 @@ def verify_github(repo: str, run_id: int) -> tuple[int, dict[str, Any]]:
 
 
 def operation_id(event: dict[str, Any], repo: str, run_id: int) -> str:
-    raw = f"{CHANNEL}:{event['threadTs']}:{event['messageTs']}:{repo}:{run_id}:{ENVIRONMENT}"
+    raw = f"{CHANNEL}:{event['threadTs']}:{repo}:{run_id}:{ENVIRONMENT}"
     return hashlib.sha256(raw.encode()).hexdigest()
 
 

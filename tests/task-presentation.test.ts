@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 import {
   formatTaskTitle,
+  formatReleaseTaskTitle,
   formatTaskDescription,
   readTaskMessage,
 } from "../src/task-presentation.js";
@@ -62,6 +63,15 @@ describe("task presentation", () => {
     expect(
       formatTaskTitle({ ...event, text: "长".repeat(200) }, "s"),
     ).toContain("长".repeat(80) + "...");
+  });
+  it("uses repository and run for release titles with a safe thread fallback", () => {
+    expect(formatReleaseTaskTitle(event, "scope", {
+      repository: "MoeGolibrary/moego-mobile",
+      runId: "12345",
+    })).toMatch(/^Release approval · MoeGolibrary\/moego-mobile · run 12345 · \[[a-f0-9]{16}\]$/);
+    expect(formatReleaseTaskTitle(event, "scope")).toContain(
+      `Release approval · thread ${event.threadTs}`,
+    );
   });
   it("renders a source link, local time and compact attachments without changing message identity", () => {
     const description = formatTaskDescription(
