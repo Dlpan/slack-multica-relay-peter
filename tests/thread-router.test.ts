@@ -213,7 +213,7 @@ describe("direct Issue routing", () => {
       execute: false,
       acceptedReactionName: "eyes",
       completedReactionName: "white_check_mark",
-      rejectedReactionName: "no_entry",
+      failedReactionName: "no_good",
     };
     f.config.releaseTaskTitle = {
       repository: "MoeGolibrary/moego-mobile",

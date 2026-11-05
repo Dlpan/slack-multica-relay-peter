@@ -89,12 +89,13 @@ describe("release approval routing", () => {
     expect({ fetchedAgent, assignedProject, assignedAgent }).toEqual({ fetchedAgent: "release-agent", assignedProject: "release-project", assignedAgent: "release-agent" });
     expect(delivered.taskPolicy).toMatchObject({ source: "relay_config", mode: "release_approval",
       execute: false, environment: "deploy-approval", ownerUserId: "U03JFM4M82C",
-      rejectedReactionName: "no_entry" });
+      failedReactionName: "no_good" });
     expect(delivered.taskPolicy.repositories).toEqual([
       "MoeGolibrary/Boarding_Desktop", "MoeGolibrary/moego-mobile", "MoeGolibrary/moego-online-booking-client-web",
     ]);
     expect(delivered.eventPayload).not.toHaveProperty("taskPolicy");
-    expect(description).toContain("当前触发消息必须明确直接 @Peter");
-    expect(description).toContain("团队简写 CC、AA、A");
+    expect(description).toContain("以 human 身份明确直接 @Peter");
+    expect(description).toContain("直接 mention 本身就是批准");
+    expect(description).toContain("添加 no_good");
   });
 });
