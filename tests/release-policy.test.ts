@@ -95,5 +95,6 @@ describe("release approval routing", () => {
     ]);
     expect(delivered.eventPayload).not.toHaveProperty("taskPolicy");
     expect(description).toContain("当前触发消息必须明确直接 @Peter");
+    expect(description).toContain("团队简写 CC、AA、A");
   });
 });

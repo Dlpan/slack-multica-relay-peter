@@ -73,6 +73,8 @@ pnpm lint
 
 此能力必须使用独立 Multica Project、Agent、Prompt 和 `github-release-approval` Skill，不复用 PR Review Agent。设置 `.env.example` 中的 `RELEASE_APPROVAL_*` 与 `MULTICA_RELEASE_APPROVAL_*` 后，Relay 仅把以下候选消息路由到专用 Agent：指定 release 频道内、固定 requester 发送、无 app/bot 来源，并且当前消息明确直接 @Peter；包括 Peter 自己在内，未 @Peter 的普通 thread 对话都只作上下文，不能触发。同一 release thread 始终复用一张任务卡，但每条新的明确 mention 都连同原文追加：有运行正在处理时作为补充输入继续触发，先前运行已结束时启动新运行；只有相同 `messageTs` 的 Slack 重复投递不产生额外执行。Agent 和 Skill 会重新读取完整 thread，并独立校验可信 root bot、唯一 GitHub run、固定仓库、workflow、environment 和 `Dlpan` 身份。任务标题优先显示根消息中的 repository 和 run ID；自动回复仍使用 Peter User actor，但固定以 `🤖 Release Agent：` 开头。
 
+在上述受信 release 上下文全部成立后，当前直接 mention 中的团队简写 `CC`、`AA`、`A`（包括“麻烦 CC”等礼貌表达）视为批准根消息对应 production release 的明确请求，不要求重复写出 approve/批准。引用、否定、询问简写含义、仅同步或撤回仍不授权；该约定不能用于其它频道、非受信根消息、非允许 requester 或未直接 mention Peter 的消息。
+
 `RELEASE_APPROVAL_ENABLED` 只控制路由；`RELEASE_APPROVAL_EXECUTE` 同时进入可信 task policy，并由 Runtime Secret 再次控制真正 GitHub 写入。初次上线必须保持 `RELEASE_APPROVAL_EXECUTE=false` 完成真实 dry-run，确认审计结果后才单独开启 live execution。Vercel 不保存 GitHub Token；审批使用本地 corporate-network Runtime 已认证的 `gh` 凭据。
 
 同步本仓库 `AGENT-PROMPT.md` 到 Peter Agent，并绑定 `multica-skills/slack-ticket-actions`。此 Prompt 基于 Peter 当前线上版本，保留身份、附件降级、Approve 和开发数据规则。不要替换其他成员的 Agent。
