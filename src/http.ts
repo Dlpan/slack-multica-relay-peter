@@ -320,7 +320,7 @@ export async function consumeQueue(
             execute: release.execute,
             acceptedReactionName: "eyes",
             completedReactionName: "white_check_mark",
-            rejectedReactionName: "no_entry",
+            failedReactionName: "no_good",
           },
           releaseTaskTitle,
         } : {}),

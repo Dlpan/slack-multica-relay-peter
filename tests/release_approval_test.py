@@ -63,6 +63,11 @@ class ReleaseApprovalTest(unittest.TestCase):
             with self.assertRaisesRegex(release.ApprovalError, "missing_owner_mention"):
                 release.verify_slack(value)
 
+    def test_confirmed_contextual_cc_shorthand_is_valid(self):
+        value = event(release.OWNER, f"<@{release.OWNER}> CC")
+        with patch.object(release, "read_thread", return_value=thread(value)):
+            self.assertEqual(release.verify_slack(value), ("MoeGolibrary/moego-mobile", 12345))
+
     def test_operation_id_is_stable_for_duplicate_mentions_of_same_run(self):
         first = event()
         second = {**first, "messageTs": "3.000001", "text": "<@U03JFM4M82C> approve again"}
