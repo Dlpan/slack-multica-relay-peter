@@ -69,6 +69,12 @@ pnpm lint
 
 新增 `SLACK_TASK_FILTER=pr_review_and_ticket`，并设置 `RELAY_OWNER_SLACK_USER_ID`（必须也在 `SLACK_TARGET_USER_IDS`）。每条消息分别生成执行策略：owner 本人发送、直接 @owner、无 app 来源的消息可进入工单语义判断；其他发送者/应用/仅用户组 mention 仍只有 PR Review 能力。排队或同一卡片的历史授权不赋予新消息额外权限；语义由 Agent 判断，Relay 不使用关键词猜动作。
 
+## 独立 production release approval 路由
+
+此能力必须使用独立 Multica Project、Agent、Prompt 和 `github-release-approval` Skill，不复用 PR Review Agent。设置 `.env.example` 中的 `RELEASE_APPROVAL_*` 与 `MULTICA_RELEASE_APPROVAL_*` 后，Relay 仅把以下候选消息路由到专用 Agent：指定 release 频道内、固定 requester 发送、无 app/bot 来源；winches/Luz 必须直接 @Peter，Peter 在同一 thread 的明确请求可不自我 @。Agent 和 Skill 会重新读取完整 thread，并独立校验可信 root bot、唯一 GitHub run、固定仓库、workflow、environment 和 `Dlpan` 身份。
+
+`RELEASE_APPROVAL_ENABLED` 只控制路由；`RELEASE_APPROVAL_EXECUTE` 同时进入可信 task policy，并由 Runtime Secret 再次控制真正 GitHub 写入。初次上线必须保持 `RELEASE_APPROVAL_EXECUTE=false` 完成真实 dry-run，确认审计结果后才单独开启 live execution。Vercel 不保存 GitHub Token；审批使用本地 corporate-network Runtime 已认证的 `gh` 凭据。
+
 同步本仓库 `AGENT-PROMPT.md` 到 Peter Agent，并绑定 `multica-skills/slack-ticket-actions`。此 Prompt 基于 Peter 当前线上版本，保留身份、附件降级、Approve 和开发数据规则。不要替换其他成员的 Agent。
 
 - 回复：读取原 Slack thread 及本地 Codex 对应项目聊天；有证据支持具体原因后，新增英文 `#intercom` 评论。

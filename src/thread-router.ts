@@ -16,6 +16,7 @@ import {
   formatTaskDescription,
   readTaskMessage,
 } from "./task-presentation.js";
+import type { ReleaseTaskPolicy } from "./task-presentation.js";
 
 export interface SlackThreadEvent {
   teamId: string;
@@ -26,7 +27,7 @@ export interface SlackThreadEvent {
   sourceAppId?: string;
   sourceBotId?: string;
   text: string;
-  mention: MentionMatch;
+  mention?: MentionMatch;
   files?: unknown;
 }
 export interface ThreadRouterConfig extends ApiConfig {
@@ -34,6 +35,7 @@ export interface ThreadRouterConfig extends ApiConfig {
   taskFilter?: TaskFilter;
   slackReactionName?: string;
   ticketOwnerUserId?: string;
+  releaseTaskPolicy?: ReleaseTaskPolicy;
 }
 interface ThreadState {
   version: 2;
@@ -71,13 +73,13 @@ export async function routeSlackThreadEvent(
     && !event.sourceAppId
     && !event.sourceBotId
     && !!findTargetMention(event.text, new Set([config.ticketOwnerUserId]), new Set());
-  const taskPolicy = config.taskFilter === "pr_review" || config.taskFilter === "pr_review_and_ticket" ? {
+  const taskPolicy = config.releaseTaskPolicy ?? (config.taskFilter === "pr_review" || config.taskFilter === "pr_review_and_ticket" ? {
     source: "relay_config" as const,
     mode: ticketEligible ? "pr_review_and_ticket" as const : "pr_review" as const,
     reactionName: config.slackReactionName ?? "eyes",
     ...(ticketEligible ? { ticketOwnerUserId: config.ticketOwnerUserId, ticketReactionName: "ack" as const,
       ticketCompletedReactionName: "white_check_mark" as const } : {}),
-  } : undefined;
+  } : undefined);
   const scope = digest(
     config.multicaWorkspaceId +
       ":" +

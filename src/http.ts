@@ -40,24 +40,30 @@ async function readBody(request: Request): Promise<string> {
 function record(value: unknown): value is Record<string, unknown> {
   return !!value && typeof value === "object" && !Array.isArray(value);
 }
+export function isReleaseApprovalCandidate(event: SlackThreadEvent, config: RelayConfig): boolean {
+  const policy = config.releaseApproval;
+  if (!policy || event.sourceAppId || event.sourceBotId) return false;
+  if (!policy.channelIds.has(event.channelId) || !policy.requesterUserIds.has(event.senderUserId)) return false;
+  if (event.senderUserId === policy.ownerUserId)
+    return event.threadTs !== event.messageTs || !!findTargetMention(event.text, new Set([policy.ownerUserId]), new Set());
+  return !!findTargetMention(event.text, new Set([policy.ownerUserId]), new Set());
+}
 function admitted(event: SlackThreadEvent, config: RelayConfig): boolean {
   const sourceAllowed = (!event.sourceAppId && !event.sourceBotId)
     || (!!event.sourceBotId && config.allowedBotIds.has(event.sourceBotId))
     || (!!event.sourceAppId
       && config.allowedAppActors.has(`${event.sourceAppId}:${event.senderUserId}`));
-  return (
-    event.teamId === config.teamId &&
-    (config.allowAllChannels || config.allowedChannelIds.has(event.channelId)) &&
-    !config.blockedChannelIds.has(event.channelId) &&
-    (config.allowAllSenders || config.allowedSenderIds.has(event.senderUserId)) &&
-    !config.blockedSenderIds.has(event.senderUserId) &&
-    sourceAllowed &&
-    !!findTargetMention(
-      event.text,
-      config.targetUserIds,
-      config.targetSubteamIds,
-    )
+  const generalMention = !!findTargetMention(
+    event.text,
+    config.targetUserIds,
+    config.targetSubteamIds,
   );
+  if (event.teamId !== config.teamId || config.blockedChannelIds.has(event.channelId) ||
+      config.blockedSenderIds.has(event.senderUserId)) return false;
+  if (isReleaseApprovalCandidate(event, config)) return true;
+  return sourceAllowed && generalMention &&
+    (config.allowAllChannels || config.allowedChannelIds.has(event.channelId)) &&
+    (config.allowAllSenders || config.allowedSenderIds.has(event.senderUserId));
 }
 function parsedEvent(value: unknown): SlackThreadEvent {
   if (
@@ -74,9 +80,9 @@ function parsedEvent(value: unknown): SlackThreadEvent {
     typeof value.text !== "string" ||
     (value.sourceAppId !== undefined && (typeof value.sourceAppId !== "string" || !/^A[A-Z0-9]+$/u.test(value.sourceAppId))) ||
     (value.sourceBotId !== undefined && (typeof value.sourceBotId !== "string" || !/^B[A-Z0-9]+$/u.test(value.sourceBotId))) ||
-    !record(value.mention) ||
-    !["user", "subteam"].includes(String(value.mention.type)) ||
-    typeof value.mention.id !== "string"
+    (value.mention !== undefined && (!record(value.mention) ||
+      !["user", "subteam"].includes(String(value.mention.type)) ||
+      typeof value.mention.id !== "string"))
   )
     throw new Error("invalid_event");
   return value as unknown as SlackThreadEvent;
@@ -168,7 +174,6 @@ export async function acceptSlack(
     config.targetUserIds,
     config.targetSubteamIds,
   );
-  if (!mention) return json({ action: "ignored", reason: "not_addressed" });
   let payload: SlackThreadEvent;
   try {
     payload = parsedEvent({
@@ -180,14 +185,14 @@ export async function acceptSlack(
       ...(event.app_id ? { sourceAppId: event.app_id } : {}),
       ...(event.bot_id ? { sourceBotId: event.bot_id } : {}),
       text: event.text,
-      mention,
+      ...(mention ? { mention } : {}),
       ...(event.files ? { files: event.files } : {}),
     });
   } catch {
     return json({ error: "invalid_event" }, 400);
   }
   if (!admitted(payload, config))
-    return json({ action: "ignored", reason: "not_allowed" });
+    return json({ action: "ignored", reason: mention ? "not_allowed" : "not_addressed" });
   try {
     const response = await fetchImpl(
       config.queueUrl + "/v2/publish/" + config.consumerUrl,
@@ -278,10 +283,31 @@ export async function consumeQueue(
       signal: init.signal ? AbortSignal.any([init.signal, deadline]) : deadline,
     });
   try {
+    const release = isReleaseApprovalCandidate(event, config) ? config.releaseApproval : undefined;
     const result = await routeSlackThreadEvent(
       event,
       {
         ...config,
+        ...(release ? {
+          multicaProjectId: release.multicaProjectId,
+          multicaAgentId: release.multicaAgentId,
+          releaseTaskPolicy: {
+            source: "relay_config",
+            mode: "release_approval",
+            ownerUserId: release.ownerUserId,
+            requesterUserIds: [...release.requesterUserIds].sort(),
+            channelIds: [...release.channelIds].sort(),
+            rootBotUserIds: [...release.rootBotUserIds].sort(),
+            rootBotIds: [...release.rootBotIds].sort(),
+            repositories: [...release.repositories].sort(),
+            workflowName: "Release to PRODUCTION",
+            workflowPath: ".github/workflows/online.yaml",
+            environment: release.environment,
+            execute: release.execute,
+            acceptedReactionName: "eyes",
+            completedReactionName: "white_check_mark",
+          },
+        } : {}),
         store: new UpstashThreadStore(
           config.kvRestApiUrl,
           config.kvRestApiToken,
