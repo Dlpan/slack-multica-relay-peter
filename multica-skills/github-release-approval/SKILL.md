@@ -23,7 +23,7 @@ Do not approve emergency or bypass paths. Do not create, retry, cancel or rerun 
 
 ## Workflow
 
-1. Read the complete Slack thread through the Slack Skill using the User actor. Verify that the current triggering message directly mentions Peter, then determine whether that message explicitly asks Peter to approve the production release represented by the trusted root message. Quoted, negated, informational, ambiguous and withdrawn requests are not authorization. Later cancellation wins. Do not use a keyword alone as proof. Other unmentioned thread replies never start another run.
+1. Read the complete Slack thread through the Slack Skill using the User actor. Verify that the current triggering message directly mentions Peter, then determine whether that message explicitly asks Peter to approve the production release represented by the trusted root message. Quoted, negated, informational, ambiguous and withdrawn requests are not authorization. Later cancellation wins. Do not use a keyword alone as proof. Other unmentioned thread replies never start another run, but every new directly mentioned message is a new trigger: supplement an active task with its exact content, or start a fresh run after the prior run ended. Only redelivery of the same Slack `messageTs` is ignored. The stable operation ID prevents duplicate GitHub writes.
 2. Save the current `eventPayload` exactly as JSON in a private temporary file. Run:
 
    `python3 scripts/release_approval.py inspect --event <event.json> --request-confirmed`
