@@ -57,10 +57,19 @@ class ReleaseApprovalTest(unittest.TestCase):
                 with self.assertRaisesRegex(release.ApprovalError, code):
                     release.verify_slack(value)
 
-    def test_owner_can_request_in_thread_without_self_mention(self):
+    def test_owner_must_also_directly_mention_self(self):
         value = event(release.OWNER, "approve this production run")
         with patch.object(release, "read_thread", return_value=thread(value)):
-            self.assertEqual(release.verify_slack(value)[1], 12345)
+            with self.assertRaisesRegex(release.ApprovalError, "missing_owner_mention"):
+                release.verify_slack(value)
+
+    def test_operation_id_is_stable_for_duplicate_mentions_of_same_run(self):
+        first = event()
+        second = {**first, "messageTs": "3.000001", "text": "<@U03JFM4M82C> approve again"}
+        self.assertEqual(
+            release.operation_id(first, "MoeGolibrary/moego-mobile", 12345),
+            release.operation_id(second, "MoeGolibrary/moego-mobile", 12345),
+        )
 
     def test_root_bot_repository_workflow_and_environment_fail_closed(self):
         value = event()

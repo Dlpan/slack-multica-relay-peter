@@ -13,10 +13,12 @@ import { findTargetMention, type MentionMatch } from "./mentions.js";
 import { type ThreadStore } from "./thread-store.js";
 import {
   formatTaskTitle,
+  formatReleaseTaskTitle,
   formatTaskDescription,
   readTaskMessage,
 } from "./task-presentation.js";
 import type { ReleaseTaskPolicy } from "./task-presentation.js";
+import type { ReleaseTaskTitleContext } from "./release-title.js";
 
 export interface SlackThreadEvent {
   teamId: string;
@@ -36,6 +38,7 @@ export interface ThreadRouterConfig extends ApiConfig {
   slackReactionName?: string;
   ticketOwnerUserId?: string;
   releaseTaskPolicy?: ReleaseTaskPolicy;
+  releaseTaskTitle?: ReleaseTaskTitleContext;
 }
 interface ThreadState {
   version: 2;
@@ -135,7 +138,9 @@ export async function routeSlackThreadEvent(
         try {
           const created = await createIssue(
             config,
-            formatTaskTitle(event, scope),
+            config.releaseTaskPolicy
+              ? formatReleaseTaskTitle(event, scope, config.releaseTaskTitle)
+              : formatTaskTitle(event, scope),
             formatTaskDescription(event, marker, false, replyContext, taskPolicy),
             fetchImpl,
           );
@@ -171,6 +176,17 @@ export async function routeSlackThreadEvent(
         STATE_TTL_SECONDS,
       );
       return { action: "created", issueId: state.issueId };
+    }
+    // A trusted release root represents exactly one GitHub run. The Agent
+    // re-reads the complete Slack thread, so later mentions are context only
+    // and must not create another execution for the same run.
+    if (config.releaseTaskPolicy) {
+      await config.store.set(
+        msgKey,
+        JSON.stringify({ phase: "done" }),
+        STATE_TTL_SECONDS,
+      );
+      return { action: "duplicate", issueId: state.issueId };
     }
     const messageMarker = `<!-- relay-message:${digest(messageKey(event))} -->`;
     const existingComment = await findComment(

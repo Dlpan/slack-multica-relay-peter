@@ -196,6 +196,38 @@ describe("direct Issue routing", () => {
     expect(f.agentGets).toBe(2);
     expect(f.commentPosts).toBe(1);
   });
+  it("coalesces later mentions in one release thread without waking the Agent again", async () => {
+    const f = fixture();
+    f.config.releaseTaskPolicy = {
+      source: "relay_config",
+      mode: "release_approval",
+      ownerUserId: "U1",
+      requesterUserIds: ["U1", "U2"],
+      channelIds: ["C1"],
+      rootBotUserIds: ["UBOT"],
+      rootBotIds: ["BBOT"],
+      repositories: ["MoeGolibrary/moego-mobile"],
+      workflowName: "Release to PRODUCTION",
+      workflowPath: ".github/workflows/online.yaml",
+      environment: "deploy-approval",
+      execute: false,
+      acceptedReactionName: "eyes",
+      completedReactionName: "white_check_mark",
+      rejectedReactionName: "no_entry",
+    };
+    f.config.releaseTaskTitle = {
+      repository: "MoeGolibrary/moego-mobile",
+      runId: "12345",
+    };
+    expect((await routeSlackThreadEvent(root, f.config, f.fetcher)).action).toBe("created");
+    const duplicateMention = { ...root, messageTs: "102.000001", text: "<@U1> approve again" };
+    expect((await routeSlackThreadEvent(duplicateMention, f.config, f.fetcher)).action).toBe("duplicate");
+    expect((await routeSlackThreadEvent(duplicateMention, f.config, f.fetcher)).action).toBe("duplicate");
+    expect(f.issuePosts).toBe(1);
+    expect(f.commentPosts).toBe(0);
+    expect(f.agentGets).toBe(1);
+    expect(f.issues[0]!.title).toContain("MoeGolibrary/moego-mobile · run 12345");
+  });
   it("recovers a committed Issue after lost response without second POST", async () => {
     const f = fixture();
     f.loseIssueResponse();

@@ -71,7 +71,7 @@ pnpm lint
 
 ## 独立 production release approval 路由
 
-此能力必须使用独立 Multica Project、Agent、Prompt 和 `github-release-approval` Skill，不复用 PR Review Agent。设置 `.env.example` 中的 `RELEASE_APPROVAL_*` 与 `MULTICA_RELEASE_APPROVAL_*` 后，Relay 仅把以下候选消息路由到专用 Agent：指定 release 频道内、固定 requester 发送、无 app/bot 来源；winches/Luz 必须直接 @Peter，Peter 在同一 thread 的明确请求可不自我 @。Agent 和 Skill 会重新读取完整 thread，并独立校验可信 root bot、唯一 GitHub run、固定仓库、workflow、environment 和 `Dlpan` 身份。
+此能力必须使用独立 Multica Project、Agent、Prompt 和 `github-release-approval` Skill，不复用 PR Review Agent。设置 `.env.example` 中的 `RELEASE_APPROVAL_*` 与 `MULTICA_RELEASE_APPROVAL_*` 后，Relay 仅把以下候选消息路由到专用 Agent：指定 release 频道内、固定 requester 发送、无 app/bot 来源，并且当前消息明确直接 @Peter；包括 Peter 自己在内，未 @Peter 的普通 thread 对话都只作上下文，不能触发。一个 release thread 只创建一次执行，后续重复 mention 不再追加唤醒 Agent。Agent 和 Skill 会重新读取完整 thread，并独立校验可信 root bot、唯一 GitHub run、固定仓库、workflow、environment 和 `Dlpan` 身份。任务标题优先显示根消息中的 repository 和 run ID；自动回复仍使用 Peter User actor，但固定以 `🤖 Release Agent：` 开头。
 
 `RELEASE_APPROVAL_ENABLED` 只控制路由；`RELEASE_APPROVAL_EXECUTE` 同时进入可信 task policy，并由 Runtime Secret 再次控制真正 GitHub 写入。初次上线必须保持 `RELEASE_APPROVAL_EXECUTE=false` 完成真实 dry-run，确认审计结果后才单独开启 live execution。Vercel 不保存 GitHub Token；审批使用本地 corporate-network Runtime 已认证的 `gh` 凭据。
 

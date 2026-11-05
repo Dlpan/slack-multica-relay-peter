@@ -7,6 +7,7 @@ import {
   type SlackMessageEvent,
 } from "./mentions.js";
 import { addSlackReaction } from "./reaction.js";
+import { readReleaseTaskTitleContext } from "./release-title.js";
 import {
   routeSlackThreadEvent,
   digest,
@@ -44,8 +45,6 @@ export function isReleaseApprovalCandidate(event: SlackThreadEvent, config: Rela
   const policy = config.releaseApproval;
   if (!policy || event.sourceAppId || event.sourceBotId) return false;
   if (!policy.channelIds.has(event.channelId) || !policy.requesterUserIds.has(event.senderUserId)) return false;
-  if (event.senderUserId === policy.ownerUserId)
-    return event.threadTs !== event.messageTs || !!findTargetMention(event.text, new Set([policy.ownerUserId]), new Set());
   return !!findTargetMention(event.text, new Set([policy.ownerUserId]), new Set());
 }
 function admitted(event: SlackThreadEvent, config: RelayConfig): boolean {
@@ -284,6 +283,21 @@ export async function consumeQueue(
     });
   try {
     const release = isReleaseApprovalCandidate(event, config) ? config.releaseApproval : undefined;
+    let releaseTaskTitle;
+    if (release) {
+      try {
+        releaseTaskTitle = await readReleaseTaskTitleContext(
+          config.slackReactionToken,
+          event,
+          boundedFetch,
+        );
+      } catch {
+        console.warn("release_task_title", {
+          messageKey: messageKey(event),
+          reason: "slack_root_read_failed",
+        });
+      }
+    }
     const result = await routeSlackThreadEvent(
       event,
       {
@@ -306,7 +320,9 @@ export async function consumeQueue(
             execute: release.execute,
             acceptedReactionName: "eyes",
             completedReactionName: "white_check_mark",
+            rejectedReactionName: "no_entry",
           },
+          releaseTaskTitle,
         } : {}),
         store: new UpstashThreadStore(
           config.kvRestApiUrl,

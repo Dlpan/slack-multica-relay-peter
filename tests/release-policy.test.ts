@@ -49,12 +49,12 @@ describe("release approval routing", () => {
     expect(isReleaseApprovalCandidate({ ...base, sourceAppId: "A1", mention: { type: "user", id: "U03JFM4M82C" } }, config)).toBe(false);
   });
 
-  it("accepts Peter's unmentioned thread reply only in the release channel", async () => {
+  it("requires Peter to mention himself in the current release request", async () => {
     const fetcher = vi.fn<typeof fetch>().mockResolvedValue(Response.json({ messageId: "queued" }));
     const response = await acceptSlack(signed({ type: "message", channel: "C01K60LEP7E", user: "U03JFM4M82C",
       ts: "2.000001", thread_ts: "1.000001", text: "please approve this run" }), env, fetcher);
-    expect(await response.json()).toEqual({ action: "accepted", queueMessageId: "queued" });
-    expect(JSON.parse(String(fetcher.mock.calls[0]![1]?.body))).not.toHaveProperty("mention");
+    expect(await response.json()).toEqual({ action: "ignored", reason: "not_addressed" });
+    expect(fetcher).not.toHaveBeenCalled();
   });
 
   it("recomputes the route and delivers only trusted release policy to the dedicated Agent", async () => {
@@ -68,6 +68,9 @@ describe("release approval routing", () => {
         if (command === "SET") { if (mode === "NX" && kv.has(key!)) return Response.json({ result: null }); kv.set(key!, value!); return Response.json({ result: "OK" }); }
         if (command === "EVAL") return Response.json({ result: 1 });
       }
+      if (url.startsWith("https://slack.com/api/conversations.replies")) return Response.json({ ok: true, messages: [
+        { ts: "1.000001", text: "Confirm Deploy https://github.com/MoeGolibrary/moego-mobile/actions/runs/12345" },
+      ] });
       if (url.includes("/api/issues?")) return Response.json({ issues: [] });
       if (url.includes("/api/agents/")) { fetchedAgent = url.split("/").at(-1)!; return Response.json({ id: fetchedAgent, workspace_id: "ws" }); }
       if (url.endsWith("/api/issues")) {
@@ -85,10 +88,12 @@ describe("release approval routing", () => {
     const delivered = JSON.parse(description.match(/```json\n([\s\S]*?)\n```/)![1]!);
     expect({ fetchedAgent, assignedProject, assignedAgent }).toEqual({ fetchedAgent: "release-agent", assignedProject: "release-project", assignedAgent: "release-agent" });
     expect(delivered.taskPolicy).toMatchObject({ source: "relay_config", mode: "release_approval",
-      execute: false, environment: "deploy-approval", ownerUserId: "U03JFM4M82C" });
+      execute: false, environment: "deploy-approval", ownerUserId: "U03JFM4M82C",
+      rejectedReactionName: "no_entry" });
     expect(delivered.taskPolicy.repositories).toEqual([
       "MoeGolibrary/Boarding_Desktop", "MoeGolibrary/moego-mobile", "MoeGolibrary/moego-online-booking-client-web",
     ]);
     expect(delivered.eventPayload).not.toHaveProperty("taskPolicy");
+    expect(description).toContain("当前触发消息必须明确直接 @Peter");
   });
 });
